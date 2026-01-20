@@ -4,6 +4,9 @@
 # Setup environment on Alma Linux 9 server to run rootless container for
 #  CloudflareD tunnel daemon.
 #
+# Vibe coded with ChatGPT 5.2 Thinking LLM on January 20, 2026.
+#   -- https://chatgpt.com/share/e/6965778b-c898-8001-b27d-209c0a5024f7
+#
 #  Prerequisites:
 #  1) Alma Linux or RHEL 9 server
 #  2) Two interfaces: eth0 connected to public subnet w public IP; eth1 connected to private subnet
