@@ -198,8 +198,12 @@ configure_routes_two_nic() {
 
 pull_cloudflared_image_rootless() {
   local u="$1" tag="$2"
+  local homedir
+  homedir="$(getent passwd "$u" | awk -F: '{print $6}')"
+  [[ -n "$homedir" && -d "$homedir" ]] || die "Could not determine home directory for user: $u"
+
   info "Pulling image as rootless user $u: docker.io/cloudflare/cloudflared:${tag}"
-  sudo -u "$u" podman pull "docker.io/cloudflare/cloudflared:${tag}"
+  sudo -H -u "$u" bash -lc "cd '$homedir' && podman pull 'docker.io/cloudflare/cloudflared:${tag}'"
 }
 
 create_quadlet_rootless() {
