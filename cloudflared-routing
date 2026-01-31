@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #------------------------------------------------------------------------------
 # cloudflared-routing.sh
-# Change default route on Linux server with user-specified interfaces.
-# Allows flexible configuration for different interface naming schemes.
+# Manage network routing for CloudflareD tunnel containers on CloudflareD
+# appliance servers. Allows flexible configuration for different interface naming.
 # Downloads current Cloudflare IPv4 prefixes dynamically.
 #
 # Implements:
@@ -19,7 +19,9 @@
 # 11) Adds optional specific routes for services via old interface
 #
 # Usage:
-#   sudo bash change-default-route.sh
+#   sudo bash cloudflared-routing.sh                    # Interactive mode
+#   sudo bash cloudflared-routing.sh --update-cf        # Update Cloudflare routes only
+#   sudo bash cloudflared-routing.sh --update-cf <iface> # Update CF routes on specific interface
 #------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -42,6 +44,32 @@ is_ipv4() {
     [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
   done
   return 0
+}
+
+show_usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [INTERFACE]
+
+Manage network routing for CloudflareD tunnel containers.
+
+OPTIONS:
+  --update-cf         Update Cloudflare IPv4 prefix routes only (no default route change)
+  --help, -h          Show this help message
+
+ARGUMENTS:
+  INTERFACE           Network interface for Cloudflare routes (only with --update-cf)
+
+EXAMPLES:
+  # Interactive mode (full configuration)
+  sudo bash cloudflared-routing.sh
+
+  # Update Cloudflare routes only (interactive interface selection)
+  sudo bash cloudflared-routing.sh --update-cf
+
+  # Update Cloudflare routes on specific interface
+  sudo bash cloudflared-routing.sh --update-cf eth0
+
+EOF
 }
 
 list_interfaces() {
@@ -195,19 +223,30 @@ configure_default_route() {
 }
 
 add_cloudflare_routes() {
-  local old_iface="$1"
+  local route_iface="$1"
   local cf_prefix_file="$2"
   
-  info "Adding Cloudflare IP range routes via ${old_iface} for container connectivity"
+  info "Adding Cloudflare IP range routes via ${route_iface} for container connectivity"
   
-  # Get old interface gateway
-  local old_gw
-  old_gw="$(ip route show | grep "${old_iface}.*metric" | awk '{print $3}' | head -n1 || true)"
+  # Get interface gateway
+  local iface_gw
+  iface_gw="$(ip route show | grep "${route_iface}.*metric" | awk '{print $3}' | head -n1 || true)"
   
-  if [[ -z "$old_gw" ]]; then
-    info "Warning: Could not determine ${old_iface} gateway automatically"
-    read -r -p "Enter ${old_iface} gateway IP for Cloudflare routes (or press Enter to skip): " old_gw
-    [[ -z "$old_gw" ]] && { info "Skipping Cloudflare-specific routes"; return 0; }
+  if [[ -z "$iface_gw" ]]; then
+    # Try to get gateway from NetworkManager
+    if is_systemctl_active NetworkManager.service && command -v nmcli >/dev/null 2>&1; then
+      local con
+      con="$(get_nmcli_con_for_dev "$route_iface" || true)"
+      if [[ -n "$con" ]]; then
+        iface_gw="$(nmcli -g ipv4.gateway con show "$con" 2>/dev/null || true)"
+      fi
+    fi
+  fi
+  
+  if [[ -z "$iface_gw" ]]; then
+    info "Warning: Could not determine ${route_iface} gateway automatically"
+    read -r -p "Enter ${route_iface} gateway IP for Cloudflare routes (or press Enter to skip): " iface_gw
+    [[ -z "$iface_gw" ]] && { info "Skipping Cloudflare-specific routes"; return 0; }
   fi
 
   # Read prefixes from downloaded file
@@ -219,49 +258,68 @@ add_cloudflare_routes() {
     return 1
   fi
 
-  info "Adding routes for ${#cf_ipv4_prefixes[@]} Cloudflare IPv4 prefixes via ${old_iface} gateway ${old_gw}"
+  info "Adding routes for ${#cf_ipv4_prefixes[@]} Cloudflare IPv4 prefixes via ${route_iface} gateway ${iface_gw}"
   for prefix in "${cf_ipv4_prefixes[@]}"; do
-    ip route add "$prefix" via "$old_gw" dev "$old_iface" 2>/dev/null || \
-    ip route replace "$prefix" via "$old_gw" dev "$old_iface"
-    info "  Added route: $prefix via $old_gw dev ${old_iface}"
+    ip route add "$prefix" via "$iface_gw" dev "$route_iface" 2>/dev/null || \
+    ip route replace "$prefix" via "$iface_gw" dev "$route_iface"
+    info "  Added route: $prefix via $iface_gw dev ${route_iface}"
   done
 
   # Persist via NetworkManager if active
   if is_systemctl_active NetworkManager.service && command -v nmcli >/dev/null 2>&1; then
-    local con_old
-    con_old="$(get_nmcli_con_for_dev "$old_iface" || true)"
+    local con
+    con="$(get_nmcli_con_for_dev "$route_iface" || true)"
     
-    if [[ -n "$con_old" ]]; then
-      info "Persisting Cloudflare routes in NetworkManager ${old_iface} connection profile"
+    if [[ -n "$con" ]]; then
+      info "Persisting Cloudflare routes in NetworkManager ${route_iface} connection profile"
       for prefix in "${cf_ipv4_prefixes[@]}"; do
-        nmcli con mod "$con_old" -ipv4.routes "$prefix $old_gw" >/dev/null 2>&1 || true
-        nmcli con mod "$con_old" +ipv4.routes "$prefix $old_gw"
+        nmcli con mod "$con" -ipv4.routes "$prefix $iface_gw" >/dev/null 2>&1 || true
+        nmcli con mod "$con" +ipv4.routes "$prefix $iface_gw"
       done
-      nmcli con up "$con_old" >/dev/null
+      nmcli con up "$con" >/dev/null
     fi
   fi
 }
 
 update_cloudflare_routes_only() {
   local cf_prefix_file="$1"
+  local specified_iface="${2:-}"
   
   info "Update mode: Only updating Cloudflare IPv4 prefix routes"
   echo
   
-  list_interfaces
-  echo
-  
   local route_iface
-  route_iface=$(prompt_for_interface "Enter interface to route Cloudflare traffic through")
-  info "Selected interface: ${route_iface}"
+  if [[ -n "$specified_iface" ]]; then
+    if ! iface_exists "$specified_iface"; then
+      die "Interface '$specified_iface' does not exist"
+    fi
+    route_iface="$specified_iface"
+    info "Using specified interface: ${route_iface}"
+  else
+    list_interfaces
+    echo
+    route_iface=$(prompt_for_interface "Enter interface to route Cloudflare traffic through")
+    info "Selected interface: ${route_iface}"
+  fi
   echo
   
   add_cloudflare_routes "$route_iface" "$cf_prefix_file"
   
   echo
   info "Cloudflare routes updated successfully"
-  info "Current Cloudflare routes:"
-  ip route show | grep -E "$(read_cloudflare_prefixes_from_file "$cf_prefix_file" | paste -sd '|')" | sed 's/^/  /' || info "  No matching routes found"
+  info "Verifying Cloudflare routes:"
+  
+  # Show first few routes as examples
+  local -a cf_ipv4_prefixes
+  mapfile -t cf_ipv4_prefixes < <(read_cloudflare_prefixes_from_file "$cf_prefix_file")
+  
+  for prefix in "${cf_ipv4_prefixes[@]:0:3}"; do
+    ip route get "$(echo "$prefix" | cut -d/ -f1)" 2>/dev/null | sed 's/^/  /' || true
+  done
+  
+  echo
+  info "To verify all Cloudflare routes:"
+  echo "  ip route show | grep -E '(104\.16\.|172\.64\.|198\.41\.)'"
 }
 
 add_custom_routes() {
@@ -356,18 +414,53 @@ show_ssh_warning() {
 main() {
   require_root
 
+  # Parse command-line arguments
+  local update_cf_only=false
+  local specified_interface=""
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --update-cf)
+        update_cf_only=true
+        shift
+        # Check if next argument is an interface name
+        if [[ $# -gt 0 && ! "$1" =~ ^-- ]]; then
+          specified_interface="$1"
+          shift
+        fi
+        ;;
+      --help|-h)
+        show_usage
+        exit 0
+        ;;
+      *)
+        echo "Error: Unknown option: $1" >&2
+        echo
+        show_usage
+        exit 1
+        ;;
+    esac
+  done
+
+  # Download Cloudflare IPv4 prefixes first (needed for both modes)
+  CF_PREFIX_FILE=$(download_cloudflare_ipv4_prefixes)
+  trap 'rm -f "$CF_PREFIX_FILE"' EXIT
+  echo
+
+  # Handle --update-cf mode
+  if [[ "$update_cf_only" == true ]]; then
+    update_cloudflare_routes_only "$CF_PREFIX_FILE" "$specified_interface"
+    exit 0
+  fi
+
+  # Full interactive mode - show SSH warning
   show_ssh_warning
 
   echo "============================================"
-  echo "  Default Route Change Script"
+  echo "  CloudflareD Routing Configuration"
   echo "============================================"
   echo
   
-  # Download Cloudflare IPv4 prefixes
-  CF_PREFIX_FILE=$(download_cloudflare_ipv4_prefixes)
-  trap 'rm -f "$CF_PREFIX_FILE"' EXIT
-  
-  echo
   info "Select operation mode:"
   echo "  1) Full route change (change default route + optional Cloudflare routes)"
   echo "  2) Update Cloudflare IPv4 prefixes only (no default route change)"
@@ -379,7 +472,7 @@ main() {
       info "Mode: Full route change"
       ;;
     2)
-      update_cloudflare_routes_only "$CF_PREFIX_FILE"
+      update_cloudflare_routes_only "$CF_PREFIX_FILE" "$specified_interface"
       exit 0
       ;;
     *)
