@@ -4,3 +4,4 @@ Bash scripts to convert a standard, rpm-based Linux server into a bespoke applia
 Vibe coded with ChatGPT 5.2 Thinking LLM on January 20, 2026.
 * https://chatgpt.com/share/e/6965778b-c898-8001-b27d-209c0a5024f7
 
+Install script and cloudflare private access tested using Alma Linux 9.6 virtual server in AWS EC2 on January 30, 2026.
