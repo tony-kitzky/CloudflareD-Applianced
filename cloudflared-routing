@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+#------------------------------------------------------------------------------
+# cloudflared-routing.sh
+# Change default route on Linux server with user-specified interfaces.
+# Allows flexible configuration for different interface naming schemes.
+# Downloads current Cloudflare IPv4 prefixes dynamically.
+#
+# Implements:
+#  1) SSH connection warning (requires "YES" to proceed)
+#  2) Mode selection: full route change or Cloudflare prefix update only
+#  3) Downloads latest Cloudflare IPv4 prefixes from official URL
+#  4) Prompts for current default interface name
+#  5) Prompts for new default interface name
+#  6) Validates interface existence
+#  7) Prompts for new default gateway IP
+#  8) Configures new interface as default route
+#  9) Configures old interface with never-default setting
+# 10) Persists changes via NetworkManager if active
+# 11) Adds optional specific routes for services via old interface
+#
+# Usage:
+#   sudo bash change-default-route.sh
+#------------------------------------------------------------------------------
+
+set -euo pipefail
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "INFO: $*" >&2; }
+warn() { echo "WARNING: $*" >&2; }
+
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0"; }
+
+iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
+
+is_systemctl_active() { systemctl is-active --quiet "$1"; }
+
+is_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+  done
+  return 0
+}
+
+list_interfaces() {
+  info "Available network interfaces:"
+  ip -br link show | awk '{print "  " $1}' | grep -v "^  lo"
+}
+
+get_current_default_interface() {
+  ip route show default 2>/dev/null | awk '$1=="default" {for(i=1;i<=NF;i++){if($i=="dev") print $(i+1)}}' | head -n1
+}
+
+get_nmcli_con_for_dev() {
+  local dev="$1"
+  command -v nmcli >/dev/null 2>&1 || return 0
+  nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: -v d="$dev" '$2==d {print $1; exit}'
+}
+
+download_cloudflare_ipv4_prefixes() {
+  local cf_url="https://www.cloudflare.com/ips-v4/"
+  local temp_file
+  temp_file=$(mktemp)
+  
+  info "Downloading latest Cloudflare IPv4 prefixes from: ${cf_url}"
+  
+  # Try curl first, fall back to wget
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -sf -o "$temp_file" "$cf_url"; then
+      rm -f "$temp_file"
+      die "Failed to download Cloudflare IPv4 prefixes using curl"
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if ! wget -q -O "$temp_file" "$cf_url"; then
+      rm -f "$temp_file"
+      die "Failed to download Cloudflare IPv4 prefixes using wget"
+    fi
+  else
+    rm -f "$temp_file"
+    die "Neither curl nor wget found. Please install one of them."
+  fi
+  
+  # Validate the file contains valid CIDR prefixes
+  local prefix_count
+  prefix_count=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$temp_file" || echo "0")
+  
+  if [[ "$prefix_count" -eq 0 ]]; then
+    rm -f "$temp_file"
+    die "Downloaded file does not contain valid IPv4 prefixes"
+  fi
+  
+  info "Successfully downloaded ${prefix_count} Cloudflare IPv4 prefixes"
+  echo "$temp_file"
+}
+
+read_cloudflare_prefixes_from_file() {
+  local file="$1"
+  local -a prefixes=()
+  
+  while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    # Validate CIDR format
+    if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+ ]]; then
+      prefixes+=("$line")
+    fi
+  done < "$file"
+  
+  printf '%s\n' "${prefixes[@]}"
+}
+
+prompt_for_interface() {
+  local prompt_msg="$1"
+  local default_val="${2:-}"
+  local iface=""
+  
+  while true; do
+    if [[ -n "$default_val" ]]; then
+      read -r -p "${prompt_msg} [${default_val}]: " iface
+      iface="${iface:-$default_val}"
+    else
+      read -r -p "${prompt_msg}: " iface
+    fi
+    
+    [[ -n "$iface" ]] || { echo "Error: Interface name cannot be empty"; continue; }
+    
+    if iface_exists "$iface"; then
+      echo "$iface"
+      return 0
+    else
+      echo "Error: Interface '$iface' does not exist"
+      list_interfaces
+    fi
+  done
+}
+
+configure_default_route() {
+  local old_iface="$1"
+  local new_iface="$2"
+  local new_gw="$3"
+
+  info "Configuring default route via ${new_iface}; ${old_iface} set to never-default"
+
+  # Remove existing default routes at runtime
+  info "Removing existing default routes..."
+  ip route del default 2>/dev/null || true
+
+  # Add new default route via new interface
+  info "Adding default route via ${new_iface} gateway ${new_gw}"
+  ip route add default via "$new_gw" dev "$new_iface"
+
+  # Verify the route was added
+  info "Current default route:"
+  ip route show default | sed 's/^/  /'
+
+  # Persist via NetworkManager if active
+  if is_systemctl_active NetworkManager.service && command -v nmcli >/dev/null 2>&1; then
+    info "NetworkManager active; persisting configuration in connection profiles"
+
+    local con_old con_new
+    con_old="$(get_nmcli_con_for_dev "$old_iface" || true)"
+    con_new="$(get_nmcli_con_for_dev "$new_iface" || true)"
+
+    # Configure old interface to never be default
+    if [[ -n "$con_old" ]]; then
+      info "Setting ${old_iface} connection to never-default"
+      nmcli con mod "$con_old" ipv4.never-default yes
+      nmcli con mod "$con_old" ipv6.never-default yes
+    else
+      info "Warning: Could not find active NetworkManager connection for ${old_iface}"
+    fi
+
+    # Configure new interface as default route
+    if [[ -n "$con_new" ]]; then
+      info "Setting ${new_iface} connection as default route with gateway ${new_gw}"
+      nmcli con mod "$con_new" ipv4.never-default no
+      nmcli con mod "$con_new" ipv6.never-default no
+      nmcli con mod "$con_new" ipv4.gateway "$new_gw"
+      
+      # Bring connections up to apply changes
+      info "Applying NetworkManager connection changes..."
+      nmcli con up "$con_new" >/dev/null
+      [[ -n "$con_old" ]] && nmcli con up "$con_old" >/dev/null || true
+    else
+      die "NetworkManager active but could not find an active NM connection for ${new_iface}"
+    fi
+  else
+    info "NetworkManager not active; routes applied at runtime only (not persistent)."
+    info "For persistence without NetworkManager, add the following to /etc/sysconfig/network-scripts/:"
+    echo "  - ifcfg-${old_iface}: Add line DEFROUTE=no"
+    echo "  - ifcfg-${new_iface}: Add lines DEFROUTE=yes and GATEWAY=${new_gw}"
+  fi
+}
+
+add_cloudflare_routes() {
+  local old_iface="$1"
+  local cf_prefix_file="$2"
+  
+  info "Adding Cloudflare IP range routes via ${old_iface} for container connectivity"
+  
+  # Get old interface gateway
+  local old_gw
+  old_gw="$(ip route show | grep "${old_iface}.*metric" | awk '{print $3}' | head -n1 || true)"
+  
+  if [[ -z "$old_gw" ]]; then
+    info "Warning: Could not determine ${old_iface} gateway automatically"
+    read -r -p "Enter ${old_iface} gateway IP for Cloudflare routes (or press Enter to skip): " old_gw
+    [[ -z "$old_gw" ]] && { info "Skipping Cloudflare-specific routes"; return 0; }
+  fi
+
+  # Read prefixes from downloaded file
+  local -a cf_ipv4_prefixes
+  mapfile -t cf_ipv4_prefixes < <(read_cloudflare_prefixes_from_file "$cf_prefix_file")
+  
+  if [[ ${#cf_ipv4_prefixes[@]} -eq 0 ]]; then
+    warn "No valid Cloudflare IPv4 prefixes found in downloaded file"
+    return 1
+  fi
+
+  info "Adding routes for ${#cf_ipv4_prefixes[@]} Cloudflare IPv4 prefixes via ${old_iface} gateway ${old_gw}"
+  for prefix in "${cf_ipv4_prefixes[@]}"; do
+    ip route add "$prefix" via "$old_gw" dev "$old_iface" 2>/dev/null || \
+    ip route replace "$prefix" via "$old_gw" dev "$old_iface"
+    info "  Added route: $prefix via $old_gw dev ${old_iface}"
+  done
+
+  # Persist via NetworkManager if active
+  if is_systemctl_active NetworkManager.service && command -v nmcli >/dev/null 2>&1; then
+    local con_old
+    con_old="$(get_nmcli_con_for_dev "$old_iface" || true)"
+    
+    if [[ -n "$con_old" ]]; then
+      info "Persisting Cloudflare routes in NetworkManager ${old_iface} connection profile"
+      for prefix in "${cf_ipv4_prefixes[@]}"; do
+        nmcli con mod "$con_old" -ipv4.routes "$prefix $old_gw" >/dev/null 2>&1 || true
+        nmcli con mod "$con_old" +ipv4.routes "$prefix $old_gw"
+      done
+      nmcli con up "$con_old" >/dev/null
+    fi
+  fi
+}
+
+update_cloudflare_routes_only() {
+  local cf_prefix_file="$1"
+  
+  info "Update mode: Only updating Cloudflare IPv4 prefix routes"
+  echo
+  
+  list_interfaces
+  echo
+  
+  local route_iface
+  route_iface=$(prompt_for_interface "Enter interface to route Cloudflare traffic through")
+  info "Selected interface: ${route_iface}"
+  echo
+  
+  add_cloudflare_routes "$route_iface" "$cf_prefix_file"
+  
+  echo
+  info "Cloudflare routes updated successfully"
+  info "Current Cloudflare routes:"
+  ip route show | grep -E "$(read_cloudflare_prefixes_from_file "$cf_prefix_file" | paste -sd '|')" | sed 's/^/  /' || info "  No matching routes found"
+}
+
+add_custom_routes() {
+  local old_iface="$1"
+  
+  info "You can add custom IP ranges to route via ${old_iface}"
+  
+  # Get old interface gateway
+  local old_gw
+  old_gw="$(ip route show | grep "${old_iface}.*metric" | awk '{print $3}' | head -n1 || true)"
+  
+  if [[ -z "$old_gw" ]]; then
+    read -r -p "Enter ${old_iface} gateway IP for custom routes: " old_gw
+    is_ipv4 "${old_gw}" || die "Invalid IPv4 address: ${old_gw}"
+  fi
+
+  while true; do
+    read -r -p "Enter IP range in CIDR notation (e.g., 10.0.0.0/8) or press Enter to finish: " cidr
+    [[ -z "$cidr" ]] && break
+    
+    # Basic CIDR validation
+    if [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+      info "Adding route: $cidr via $old_gw dev ${old_iface}"
+      ip route add "$cidr" via "$old_gw" dev "$old_iface" 2>/dev/null || \
+      ip route replace "$cidr" via "$old_gw" dev "$old_iface"
+      
+      # Persist via NetworkManager if active
+      if is_systemctl_active NetworkManager.service && command -v nmcli >/dev/null 2>&1; then
+        local con_old
+        con_old="$(get_nmcli_con_for_dev "$old_iface" || true)"
+        
+        if [[ -n "$con_old" ]]; then
+          nmcli con mod "$con_old" -ipv4.routes "$cidr $old_gw" >/dev/null 2>&1 || true
+          nmcli con mod "$con_old" +ipv4.routes "$cidr $old_gw"
+        fi
+      fi
+    else
+      echo "Error: Invalid CIDR format. Example: 192.168.0.0/16"
+    fi
+  done
+}
+
+verify_routing() {
+  info "Routing verification:"
+  
+  echo
+  info "Default route:"
+  ip route show default | sed 's/^/  /'
+  
+  echo
+  info "Test route to public IP (8.8.8.8):"
+  ip route get 8.8.8.8 | sed 's/^/  /'
+  
+  echo
+  info "Test route to Cloudflare IP (1.1.1.1):"
+  ip route get 1.1.1.1 | sed 's/^/  /'
+  
+  echo
+  info "All routes:"
+  ip route show | sed 's/^/  /'
+}
+
+show_ssh_warning() {
+  echo "╔════════════════════════════════════════════════════════════════════════╗"
+  echo "║                              ⚠️  WARNING  ⚠️                              ║"
+  echo "╚════════════════════════════════════════════════════════════════════════╝"
+  echo
+  warn "This script will modify network routing configuration!"
+  warn "If you are connected via SSH over a PUBLIC IP address, your connection"
+  warn "WILL BE DROPPED when the default route changes."
+  echo
+  warn "Only proceed if:"
+  echo "  1. You have console/out-of-band access to this server, OR"
+  echo "  2. You are connected via a management network that won't be affected, OR"
+  echo "  3. You are physically at the console"
+  echo
+  warn "If your SSH session drops, you may lose access to the server!"
+  echo
+  read -r -p "Type 'YES' (case sensitive) to acknowledge and continue: " confirm
+  
+  if [[ "$confirm" != "YES" ]]; then
+    echo
+    info "Confirmation not received. Exiting safely."
+    exit 0
+  fi
+  
+  echo
+  info "Confirmation received. Proceeding..."
+  echo
+}
+
+main() {
+  require_root
+
+  show_ssh_warning
+
+  echo "============================================"
+  echo "  Default Route Change Script"
+  echo "============================================"
+  echo
+  
+  # Download Cloudflare IPv4 prefixes
+  CF_PREFIX_FILE=$(download_cloudflare_ipv4_prefixes)
+  trap 'rm -f "$CF_PREFIX_FILE"' EXIT
+  
+  echo
+  info "Select operation mode:"
+  echo "  1) Full route change (change default route + optional Cloudflare routes)"
+  echo "  2) Update Cloudflare IPv4 prefixes only (no default route change)"
+  echo
+  read -r -p "Enter choice [1/2]: " MODE_CHOICE
+  
+  case "$MODE_CHOICE" in
+    1)
+      info "Mode: Full route change"
+      ;;
+    2)
+      update_cloudflare_routes_only "$CF_PREFIX_FILE"
+      exit 0
+      ;;
+    *)
+      die "Invalid choice. Enter 1 or 2."
+      ;;
+  esac
+
+  echo
+  info "This script changes the default route between network interfaces"
+  echo
+
+  # Show available interfaces
+  list_interfaces
+  echo
+
+  # Get current default interface
+  local current_default
+  current_default="$(get_current_default_interface || true)"
+  
+  if [[ -n "$current_default" ]]; then
+    info "Current default interface: ${current_default}"
+  else
+    info "No default route currently configured"
+  fi
+  echo
+
+  # Prompt for old (current) default interface
+  OLD_IFACE=$(prompt_for_interface "Enter current default interface name" "$current_default")
+  info "Selected current default interface: ${OLD_IFACE}"
+  echo
+
+  # Prompt for new default interface
+  while true; do
+    NEW_IFACE=$(prompt_for_interface "Enter new default interface name")
+    
+    if [[ "$NEW_IFACE" == "$OLD_IFACE" ]]; then
+      echo "Error: New interface must be different from current interface"
+      continue
+    fi
+    
+    info "Selected new default interface: ${NEW_IFACE}"
+    break
+  done
+  echo
+
+  # Prompt for new gateway
+  read -r -p "Enter gateway IP for ${NEW_IFACE}: " NEW_GW
+  is_ipv4 "${NEW_GW}" || die "Invalid IPv4 address: ${NEW_GW}"
+  echo
+
+  # Ask about Cloudflare routes
+  read -r -p "Add specific routes for Cloudflare IP ranges via ${OLD_IFACE}? [y/N]: " ADD_CF_ROUTES
+  ADD_CF_ROUTES="${ADD_CF_ROUTES:-n}"
+  echo
+
+  # Ask about custom routes
+  read -r -p "Add custom IP ranges to route via ${OLD_IFACE}? [y/N]: " ADD_CUSTOM_ROUTES
+  ADD_CUSTOM_ROUTES="${ADD_CUSTOM_ROUTES:-n}"
+  echo
+
+  # Confirmation
+  echo "Summary of changes:"
+  echo "  - Old default interface: ${OLD_IFACE} (will be set to never-default)"
+  echo "  - New default interface: ${NEW_IFACE}"
+  echo "  - New default gateway: ${NEW_GW}"
+  echo "  - Cloudflare routes via ${OLD_IFACE}: $(if [[ "${ADD_CF_ROUTES}" =~ ^[Yy]$ ]]; then echo "Yes"; else echo "No"; fi)"
+  echo "  - Custom routes via ${OLD_IFACE}: $(if [[ "${ADD_CUSTOM_ROUTES}" =~ ^[Yy]$ ]]; then echo "Yes"; else echo "No"; fi)"
+  echo
+  read -r -p "Proceed with these changes? [y/N]: " CONFIRM
+  [[ "${CONFIRM}" =~ ^[Yy]$ ]] || die "Operation cancelled by user"
+  echo
+
+  info "Starting route reconfiguration..."
+  
+  configure_default_route "${OLD_IFACE}" "${NEW_IFACE}" "${NEW_GW}"
+
+  if [[ "${ADD_CF_ROUTES}" =~ ^[Yy]$ ]]; then
+    add_cloudflare_routes "${OLD_IFACE}" "$CF_PREFIX_FILE"
+  fi
+
+  if [[ "${ADD_CUSTOM_ROUTES}" =~ ^[Yy]$ ]]; then
+    add_custom_routes "${OLD_IFACE}"
+  fi
+
+  echo
+  verify_routing
+
+  echo
+  info "Done. Changes applied."
+  info "For rootless containers: The container inherits the host's routing table,"
+  info "so containers will use the routes configured above."
+  echo
+  info "To verify after reboot:"
+  echo "  ip route show"
+  echo "  ip route get 1.1.1.1"
+  echo "  ip route get 8.8.8.8"
+}
+
+main "$@"
