@@ -10,15 +10,16 @@
 # Implements:
 #  1) Install packages: podman, passt
 #  2) Prompt for:
-#      a) username to run rootless cloudflared (create if missing)
+#      a) username to run rootless cloudflared (create if missing) -- default: cloudflared
 #      b) cloudflared image tag
 #      c) cloudflared tunnel token (dashboard-generated)
 #      d) whether server uses 1 NIC or 2 NICs (NEW)
-#      e) RFC1918 next-hop gateway IP for routes via eth1 (only if 2 NICs)
+#      e) OPTIONAL: RFC1918 next-hop gateway IP for routes via eth1 (only if 2 NICs AND routing chosen)
+#      f) OPTIONAL: allow skipping IPv4 routing modifications even if 2 NICs present
 #  3) Enable persistent journaling + per-user journals
 #  4) Enable boot-start for user services (linger) for the cloudflared user
 #  5) Write /etc/sysctl.d/99-cloudflared.conf
-#  6) OPTIONAL host routes if 2 NICs:
+#  6) OPTIONAL host routes if 2 NICs and routing not skipped:
 #      - default remains on eth0
 #      - RFC1918 prefixes via eth1 next-hop (prompted)
 #      - ensure eth1 has NO default route
@@ -278,8 +279,9 @@ main() {
   install_packages
 
   echo
-  read -r -p "Enter username to run cloudflared (rootless) [will be created if missing]: " CF_USER
-  [[ -n "${CF_USER}" ]] || die "Username cannot be empty"
+  # Default rootless user is "cloudflared"
+  read -r -p "Enter username to run cloudflared (rootless) [cloudflared]: " CF_USER
+  CF_USER="${CF_USER:-cloudflared}"
   ensure_user "${CF_USER}"
 
   read -r -p "Enter cloudflared image tag (e.g., 2025.11.1): " CF_TAG
@@ -294,13 +296,24 @@ main() {
   read -r -p "Does this server have 1 or 2 network interfaces for routing? [1/2]: " NIC_COUNT
   [[ "${NIC_COUNT}" == "1" || "${NIC_COUNT}" == "2" ]] || die "Enter 1 or 2"
 
+  # New: allow user to skip IPv4 routing modifications even if 2 NICs are present
+  APPLY_IPV4_ROUTES="n"
   ETH1_RFC1918_GW=""
+
   if [[ "${NIC_COUNT}" == "2" ]]; then
     iface_exists eth1 || die "You selected 2 NICs, but interface eth1 was not found."
 
     echo
-    read -r -p "Enter RFC1918 next-hop gateway IP to use via eth1 (e.g., 10.98.0.1): " ETH1_RFC1918_GW
-    is_ipv4 "${ETH1_RFC1918_GW}" || die "Invalid IPv4 address for RFC1918 next-hop gateway: ${ETH1_RFC1918_GW}"
+    read -r -p "Apply IPv4 routing modifications for eth1 (RFC1918 routes + ensure no default on eth1)? [y/N]: " APPLY_IPV4_ROUTES
+    APPLY_IPV4_ROUTES="${APPLY_IPV4_ROUTES:-n}"
+
+    if [[ "${APPLY_IPV4_ROUTES}" =~ ^[Yy]$ ]]; then
+      echo
+      read -r -p "Enter RFC1918 next-hop gateway IP to use via eth1 (e.g., 10.98.0.1): " ETH1_RFC1918_GW
+      is_ipv4 "${ETH1_RFC1918_GW}" || die "Invalid IPv4 address for RFC1918 next-hop gateway: ${ETH1_RFC1918_GW}"
+    else
+      info "Skipping IPv4 routing modifications as requested."
+    fi
   else
     info "Single-NIC selected; skipping RFC1918 static route configuration."
   fi
@@ -309,7 +322,7 @@ main() {
   enable_linger_for_user "${CF_USER}"
   write_sysctl_cloudflared
 
-  if [[ "${NIC_COUNT}" == "2" ]]; then
+  if [[ "${NIC_COUNT}" == "2" && "${APPLY_IPV4_ROUTES}" =~ ^[Yy]$ ]]; then
     configure_routes_two_nic "${ETH1_RFC1918_GW}"
   fi
 
