@@ -27,7 +27,9 @@
 #  7) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>)
 #  8) Create Quadlet base + drop-ins
 #  9) Start the cloudflared.service (systemd --user) for the selected user
-# 10) Write /etc/profile.d/cloudflare-alias.sh
+# 10) Install /usr/local/sbin/cloudflared-container management command
+#     (menu-driven status/restart/upgrade tool; usable by any sudoer)
+# 11) Write /etc/profile.d/cloudflare-alias.sh
 #
 # Notes:
 #  - Token is stored on disk in a drop-in file (0600). Protect the user account.
@@ -213,6 +215,265 @@ pull_cloudflared_image_rootless() {
   sudo -H -u "$u" bash -lc "cd '$homedir' && podman pull 'docker.io/cloudflare/cloudflared:${tag}'"
 }
 
+install_management_command() {
+  local install_path="/usr/local/sbin/cloudflared-container"
+
+  info "Installing cloudflared-container management command to: ${install_path}"
+
+  cat >"${install_path}" <<'MANAGE_SCRIPT_EOF'
+#!/usr/bin/env bash
+#------------------------------------------------------------------------------
+# cloudflared-container
+# Menu-driven management tool for the rootless "cloudflared-container"
+# Podman Quadlet deployment created by cloudflared-container-setup.sh.
+#
+# Must be run with sudo/root. Internally switches to the cloudflared user's
+# systemd --user session via XDG_RUNTIME_DIR so any sudoer can manage the
+# container without needing to log in as that user directly.
+#
+# Usage:
+#   sudo cloudflared-container
+#------------------------------------------------------------------------------
+
+set -euo pipefail
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "INFO: $*" >&2; }
+warn() { echo "WARN: $*" >&2; }
+
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo cloudflared-container"; }
+
+user_exists() { id "$1" >/dev/null 2>&1; }
+
+user_uid() { id -u "$1"; }
+
+user_home() { getent passwd "$1" | awk -F: '{print $6}'; }
+
+# Run systemctl --user for a given user, setting XDG_RUNTIME_DIR so that
+# any sudo-privileged caller (not just the cloudflared user itself) can
+# reach that user's systemd --user session and manage the container.
+user_systemctl() {
+  local u="$1"; shift
+  local uid; uid="$(user_uid "$u")"
+  local runtime_dir="/run/user/${uid}"
+
+  if [[ ! -d "$runtime_dir" ]]; then
+    mkdir -p "$runtime_dir"
+    chown "${uid}:${uid}" "$runtime_dir"
+    chmod 0700 "$runtime_dir"
+  fi
+
+  sudo -u "$u" env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user "$@"
+}
+
+# Run an arbitrary command as the cloudflared user with XDG_RUNTIME_DIR set,
+# e.g. for podman commands that talk to the user's rootless Podman socket.
+user_run() {
+  local u="$1"; shift
+  local uid; uid="$(user_uid "$u")"
+  local runtime_dir="/run/user/${uid}"
+  local homedir; homedir="$(user_home "$u")"
+
+  if [[ ! -d "$runtime_dir" ]]; then
+    mkdir -p "$runtime_dir"
+    chown "${uid}:${uid}" "$runtime_dir"
+    chmod 0700 "$runtime_dir"
+  fi
+
+  sudo -H -u "$u" env XDG_RUNTIME_DIR="$runtime_dir" bash -lc "cd '$homedir' && $*"
+}
+
+# Try to auto-detect the user running the cloudflared Quadlet service by
+# scanning systemd --user sessions for anyone with a cloudflared.service
+# unit loaded. Falls back to "cloudflared" if detection is inconclusive.
+detect_cloudflared_user() {
+  local candidate
+
+  # Prefer an explicit match: any home directory with the Quadlet container
+  # file this setup writes.
+  for pw_home in $(getent passwd | awk -F: '{print $6}'); do
+    if [[ -f "${pw_home}/.config/containers/systemd/cloudflared.container" ]]; then
+      candidate="$(getent passwd | awk -F: -v h="$pw_home" '$6==h {print $1; exit}')"
+      if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+      fi
+    fi
+  done
+
+  # Fall back to the conventional default username.
+  if user_exists "cloudflared"; then
+    echo "cloudflared"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_cf_user() {
+  local detected=""
+  detected="$(detect_cloudflared_user || true)"
+
+  if [[ -n "$detected" ]]; then
+    read -r -p "Username running cloudflared [${detected}]: " CF_USER
+    CF_USER="${CF_USER:-$detected}"
+  else
+    read -r -p "Username running cloudflared: " CF_USER
+    [[ -n "$CF_USER" ]] || die "Username cannot be empty"
+  fi
+
+  user_exists "$CF_USER" || die "User '${CF_USER}' does not exist on this system"
+
+  QUADLET_DIR="$(user_home "$CF_USER")/.config/containers/systemd"
+  DROPIN_DIR="${QUADLET_DIR}/cloudflared.container.d"
+  IMAGE_DROPIN="${DROPIN_DIR}/40-image.conf"
+
+  [[ -d "$QUADLET_DIR" ]] || die "Quadlet directory not found for ${CF_USER}: ${QUADLET_DIR}"
+}
+
+#------------------------------------------------------------------------------
+# 1) Show cloudflared container status
+#------------------------------------------------------------------------------
+action_status() {
+  echo
+  info "== podman status (as user: ${CF_USER}) =="
+  user_run "$CF_USER" "podman ps -a --filter name=cloudflared" || warn "Failed to list podman containers"
+
+  echo
+  user_run "$CF_USER" "podman inspect cloudflared --format 'State: {{.State.Status}}  |  Started: {{.State.StartedAt}}  |  Image: {{.Config.Image}}'" 2>/dev/null || \
+    warn "Could not inspect 'cloudflared' container (it may not be running)"
+
+  echo
+  info "== systemctl --user status cloudflared.container (as user: ${CF_USER}) =="
+  user_systemctl "$CF_USER" status cloudflared.container -l --no-pager || \
+    warn "Could not read systemctl --user status for cloudflared.container"
+
+  echo
+  info "== Recent journal (last 30 lines) =="
+  if user_systemctl "$CF_USER" list-units cloudflared.service >/dev/null 2>&1; then
+    sudo -u "$CF_USER" env XDG_RUNTIME_DIR="/run/user/$(user_uid "$CF_USER")" \
+      journalctl --user -u cloudflared.service -n 30 --no-pager 2>/dev/null || \
+      warn "Could not read recent journal entries"
+  else
+    warn "cloudflared.service unit not found; skipping journal output"
+  fi
+}
+
+#------------------------------------------------------------------------------
+# 2) Restart the cloudflared container
+#------------------------------------------------------------------------------
+action_restart() {
+  echo
+  info "Restarting cloudflared.service for user: ${CF_USER}"
+  user_systemctl "$CF_USER" restart cloudflared.service || die "Failed to restart cloudflared.service"
+
+  sleep 2
+  info "Restart complete. Current status:"
+  user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+}
+
+#------------------------------------------------------------------------------
+# 3) Upgrade the cloudflared container
+#------------------------------------------------------------------------------
+action_upgrade() {
+  [[ -f "$IMAGE_DROPIN" ]] || die "Image drop-in not found: ${IMAGE_DROPIN}"
+
+  local current_tag=""
+  current_tag="$(grep -E '^Image=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Image=docker\.io/cloudflare/cloudflared:##')"
+
+  echo
+  info "Current image tag: ${current_tag:-unknown}"
+  read -r -p "Enter the new cloudflared image tag (e.g., 2025.11.1): " NEW_TAG
+  [[ -n "$NEW_TAG" ]] || die "Image tag cannot be empty"
+
+  if [[ "$NEW_TAG" == "$current_tag" ]]; then
+    read -r -p "New tag matches the current tag (${current_tag}). Continue anyway? [y/N]: " confirm_same
+    [[ "${confirm_same,,}" == "y" ]] || { info "Upgrade cancelled."; return 0; }
+  fi
+
+  local new_image="docker.io/cloudflare/cloudflared:${NEW_TAG}"
+
+  info "Pulling new image as user ${CF_USER}: ${new_image}"
+  user_run "$CF_USER" "podman pull '${new_image}'" || die "Failed to pull image: ${new_image}"
+
+  info "Updating image drop-in: ${IMAGE_DROPIN}"
+  cat >"${IMAGE_DROPIN}" <<EOF
+[Container]
+Image=${new_image}
+Pull=never
+EOF
+  chown "${CF_USER}:${CF_USER}" "${IMAGE_DROPIN}"
+  chmod 0600 "${IMAGE_DROPIN}"
+
+  info "Reloading systemd --user daemon for user: ${CF_USER}"
+  user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
+
+  echo
+  read -r -p "Restart cloudflared.service now to apply the new image? [Y/n]: " do_restart
+  do_restart="${do_restart:-y}"
+  if [[ "${do_restart,,}" == "y" ]]; then
+    user_systemctl "$CF_USER" restart cloudflared.service || die "Failed to restart cloudflared.service after upgrade"
+    sleep 2
+    info "Upgrade complete. Current status:"
+    user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+  else
+    warn "Image updated but service not restarted. The old container keeps running the previous image until restarted."
+  fi
+}
+
+print_menu() {
+  echo
+  echo "=========================================="
+  echo " cloudflared-container management (user: ${CF_USER})"
+  echo "=========================================="
+  echo "  1) Show status"
+  echo "  2) Restart container"
+  echo "  3) Upgrade container (change image tag)"
+  echo "  4) Switch user"
+  echo "  q) Quit"
+  echo
+}
+
+main() {
+  require_root
+  resolve_cf_user
+
+  # Allow non-interactive one-shot invocation: cloudflared-container status|restart|upgrade
+  if [[ "${1:-}" != "" ]]; then
+    case "${1}" in
+      status)  action_status ;;
+      restart) action_restart ;;
+      upgrade) action_upgrade ;;
+      *) die "Unknown action: ${1}. Valid actions: status, restart, upgrade" ;;
+    esac
+    exit 0
+  fi
+
+  while true; do
+    print_menu
+    read -r -p "Select an option: " choice
+    case "$choice" in
+      1) action_status ;;
+      2) action_restart ;;
+      3) action_upgrade ;;
+      4) resolve_cf_user ;;
+      q|Q) info "Exiting."; exit 0 ;;
+      *) warn "Invalid selection: ${choice}" ;;
+    esac
+  done
+}
+
+main "$@"
+MANAGE_SCRIPT_EOF
+
+  chmod 0755 "${install_path}"
+  chown root:root "${install_path}"
+
+  info "Management command installed: ${install_path}"
+  info "  Run interactively: sudo cloudflared-container"
+  info "  Or non-interactively: sudo cloudflared-container status|restart|upgrade"
+}
+
 create_quadlet_rootless() {
   local u="$1" tag="$2" token="$3"
   local homedir quadlet_dir container_file dropin_dir image_dropin icmp_dropin token_dropin env_file
@@ -351,6 +612,8 @@ main() {
 
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
   create_quadlet_rootless "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}"
+
+  install_management_command
 
   info "Installing cloudflared aliases for user ${CF_USER}"
 

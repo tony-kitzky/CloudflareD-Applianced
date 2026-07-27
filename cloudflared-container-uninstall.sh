@@ -22,10 +22,11 @@
 #  6) Remove /etc/systemd/journald.conf.d/99-persistent.conf (persistent
 #     journaling) and restart journald if requested
 #  7) Remove /etc/profile.d/cloudflared-aliases.sh
-#  8) Remove subuid/subgid ranges this setup allocated for the cloudflared
+#  8) Remove /usr/local/sbin/cloudflared-container management command
+#  9) Remove subuid/subgid ranges this setup allocated for the cloudflared
 #     user (only the range the setup script adds: 100000-165535), IF the
 #     user account itself is not being kept for other purposes
-#  9) OPTIONAL: remove the cloudflared user account and home directory
+# 10) OPTIONAL: remove the cloudflared user account and home directory
 #
 # What this script deliberately does NOT touch:
 #  - Packages installed by setup (podman, passt) -- shared system packages,
@@ -321,7 +322,22 @@ remove_cloudflared_aliases() {
 }
 
 #------------------------------------------------------------------------------
-# 8) Remove the subuid/subgid range setup allocated (100000-165535)
+# 8) Remove the /usr/local/sbin/cloudflared-container management command
+#    installed by cloudflared-container-setup.sh
+#------------------------------------------------------------------------------
+remove_management_command() {
+  local install_path="/usr/local/sbin/cloudflared-container"
+
+  if [[ -f "$install_path" ]]; then
+    info "Removing management command: $install_path"
+    rm -f "$install_path"
+  else
+    warn "Management command not found: $install_path (may already be removed)"
+  fi
+}
+
+#------------------------------------------------------------------------------
+# 9) Remove the subuid/subgid range setup allocated (100000-165535)
 #------------------------------------------------------------------------------
 remove_subuid_subgid_range() {
   local u="$1"
@@ -343,7 +359,7 @@ remove_subuid_subgid_range() {
 }
 
 #------------------------------------------------------------------------------
-# 9) Optionally remove the cloudflared user account
+# 10) Optionally remove the cloudflared user account
 #------------------------------------------------------------------------------
 remove_user_account() {
   local u="$1"
@@ -434,7 +450,10 @@ main() {
   # 7. Remove shell aliases
   remove_cloudflared_aliases
 
-  # 8/9. subuid/subgid + optional user removal
+  # 8. Remove the cloudflared-container management command
+  remove_management_command
+
+  # 9/10. subuid/subgid + optional user removal
   echo
   read -r -p "Remove user account '${CF_USER}' and home directory? [y/N]: " REMOVE_USER
   REMOVE_USER="${REMOVE_USER,,}"
@@ -463,6 +482,7 @@ main() {
   fi
   [[ "$REMOVE_JOURNAL" == "y" ]] && echo "  - Persistent journaling configuration removed"
   echo "  - /etc/profile.d/cloudflared-aliases.sh removed"
+  echo "  - /usr/local/sbin/cloudflared-container management command removed"
   if [[ "$REMOVE_USER" == "y" ]]; then
     echo "  - subuid/subgid range removed and user account '${CF_USER}' deleted"
   fi
