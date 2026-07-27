@@ -13,17 +13,17 @@
 #      a) username to run rootless cloudflared (create if missing) -- default: cloudflared
 #      b) cloudflared image tag
 #      c) cloudflared tunnel token (dashboard-generated)
-#      d) whether server uses 1 NIC or 2 NICs (NEW)
-#      e) OPTIONAL: RFC1918 next-hop gateway IP for routes via eth1 (only if 2 NICs AND routing chosen)
-#      f) OPTIONAL: allow skipping IPv4 routing modifications even if 2 NICs present
+#      d) whether server uses 1 NIC or 2 NICs
+#      e) OPTIONAL: enable policy routing for dual-NIC origin traffic via eth1
 #  3) Enable persistent journaling + per-user journals
 #  4) Enable boot-start for user services (linger) for the cloudflared user
-#  5) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers 
-#  6) OPTIONAL host routes if 2 NICs and routing not skipped:
+#  5) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
+#  6) OPTIONAL policy routing if 2 NICs and enabled:
 #      - default remains on eth0
-#      - RFC1918 prefixes via eth1 next-hop (prompted)
-#      - ensure eth1 has NO default route
-#      - persistence via NetworkManager if active; otherwise runtime only
+#      - route-table "origin" created in /etc/iproute2/rt_tables
+#      - RFC1918 prefixes via eth1 in route-table origin
+#      - rule to lookup traffic sourced from the eth1 IPv4 address
+#      - persistence via /etc/sysconfig/network-scripts/route-eth1 and rule-eth1
 #  7) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>)
 #  8) Create Quadlet base + drop-ins
 #  9) Start the cloudflared.service (systemd --user) for the selected user
@@ -47,8 +47,6 @@ require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0"; }
 
 iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
 
-is_systemctl_active() { systemctl is-active --quiet "$1"; }
-
 user_exists() { id "$1" >/dev/null 2>&1; }
 
 ensure_user() {
@@ -63,6 +61,11 @@ ensure_user() {
 
 user_uid() { id -u "$1"; }
 
+get_ipv4_addr_for_dev() {
+  local dev="$1"
+  ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
+}
+
 # Run systemctl --user for a given user in non-interactive contexts.
 user_systemctl() {
   local u="$1"; shift
@@ -73,36 +76,6 @@ user_systemctl() {
   chmod 0700 "/run/user/${uid}"
 
   sudo -u "$u" env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user "$@"
-}
-
-# Get default gateway for eth0 from "ip route show"
-get_default_gw_for_dev() {
-  local dev="$1"
-  ip route show default 2>/dev/null | awk -v d="$dev" '
-    $1=="default" {
-      via=""; devx="";
-      for(i=1;i<=NF;i++){
-        if($i=="via") via=$(i+1);
-        if($i=="dev") devx=$(i+1);
-      }
-      if(devx==d && via!=""){print via; exit}
-    }'
-}
-
-get_nmcli_con_for_dev() {
-  local dev="$1"
-  command -v nmcli >/dev/null 2>&1 || return 0
-  nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: -v d="$dev" '$2==d {print $1; exit}'
-}
-
-is_ipv4() {
-  local ip="$1"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
-  for o in "$o1" "$o2" "$o3" "$o4"; do
-    [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
-  done
-  return 0
 }
 
 install_packages() {
@@ -151,51 +124,41 @@ EOF
   sysctl --system >/dev/null
 }
 
-configure_routes_two_nic() {
-  local eth1_rfc1918_gw="$1"
+configure_policy_routing_two_nic() {
+  local eth1_ip="$1"
+  local rt_name="origin"
+  local rt_id="100"
+  local rt_tables_file="/etc/iproute2/rt_tables"
+  local rules_file="/etc/sysconfig/network-scripts/rule-eth1"
+  local routes_file="/etc/sysconfig/network-scripts/route-eth1"
 
-  info "Configuring routes: default via eth0; RFC1918 via eth1 next-hop ${eth1_rfc1918_gw}; ensure eth1 has no default route"
+  info "Configuring policy routing for dual-NIC host using route table '${rt_name}' from source ${eth1_ip}"
 
-  local eth0_gw
-  eth0_gw="$(get_default_gw_for_dev eth0 || true)"
-  [[ -n "$eth0_gw" ]] || die "Could not determine eth0 default gateway from: ip route show default"
+  grep -Eq "^[[:space:]]*${rt_id}[[:space:]]+${rt_name}(\\s|$)" "$rt_tables_file" 2>/dev/null || \
+    echo "${rt_id} ${rt_name}" >> "$rt_tables_file"
 
-  # Remove any default route on eth1 at runtime (ignore errors if none exist)
-  ip route del default dev eth1 2>/dev/null || true
+  ip route replace 10.0.0.0/8 dev eth1 table "$rt_name"
+  ip route replace 172.16.0.0/12 dev eth1 table "$rt_name"
+  ip route replace 192.168.0.0/16 dev eth1 table "$rt_name"
 
-  # Add/replace RFC1918 routes via eth1 gateway at runtime
-  ip route replace 10.0.0.0/8 via "$eth1_rfc1918_gw" dev eth1
-  ip route replace 172.16.0.0/12 via "$eth1_rfc1918_gw" dev eth1
-  ip route replace 192.168.0.0/16 via "$eth1_rfc1918_gw" dev eth1
+  ip rule del from "$eth1_ip/32" table "$rt_name" 2>/dev/null || true
+  ip rule add from "$eth1_ip/32" table "$rt_name" priority 100
 
-  # Persist via NetworkManager if active
-  if is_systemctl_active NetworkManager.service && command -v nmcli >/dev/null 2>&1; then
-    info "NetworkManager active; persisting RFC1918 routes in the eth1 connection profile"
+  mkdir -p /etc/sysconfig/network-scripts
+  cat >"$routes_file" <<EOF
+10.0.0.0/8 dev eth1 table ${rt_name}
+172.16.0.0/12 dev eth1 table ${rt_name}
+192.168.0.0/16 dev eth1 table ${rt_name}
+EOF
 
-    local con1 con0
-    con0="$(get_nmcli_con_for_dev eth0 || true)"
-    con1="$(get_nmcli_con_for_dev eth1 || true)"
-    [[ -n "$con1" ]] || die "NetworkManager active but could not find an active NM connection for eth1"
+  cat >"$rules_file" <<EOF
+from ${eth1_ip}/32 table ${rt_name} priority 100
+EOF
 
-    nmcli con mod "$con1" ipv4.never-default yes || true
-
-    nmcli con mod "$con1" -ipv4.routes "10.0.0.0/8 $eth1_rfc1918_gw" >/dev/null 2>&1 || true
-    nmcli con mod "$con1" -ipv4.routes "172.16.0.0/12 $eth1_rfc1918_gw" >/dev/null 2>&1 || true
-    nmcli con mod "$con1" -ipv4.routes "192.168.0.0/16 $eth1_rfc1918_gw" >/dev/null 2>&1 || true
-
-    nmcli con mod "$con1" +ipv4.routes "10.0.0.0/8 $eth1_rfc1918_gw"
-    nmcli con mod "$con1" +ipv4.routes "172.16.0.0/12 $eth1_rfc1918_gw"
-    nmcli con mod "$con1" +ipv4.routes "192.168.0.0/16 $eth1_rfc1918_gw"
-
-    nmcli con up "$con1" >/dev/null
-    [[ -n "$con0" ]] && nmcli con up "$con0" >/dev/null || true
-  else
-    info "NetworkManager not active; routes applied at runtime only (not persistent)."
-  fi
-
-  info "Route sanity check:"
-  ip route get 10.1.2.3 | sed 's/^/  /'
-  ip route get 1.1.1.1 | sed 's/^/  /'
+  info "Policy routing sanity check:"
+  ip rule show | sed 's/^/  /'
+  ip route show table "$rt_name" | sed 's/^/  /'
+  ip route get 10.1.2.3 from "$eth1_ip" | sed 's/^/  /' || true
 }
 
 pull_cloudflared_image_rootless() {
@@ -210,7 +173,7 @@ pull_cloudflared_image_rootless() {
 
 create_quadlet_rootless() {
   local u="$1" tag="$2" token="$3"
-  local homedir quadlet_dir container_file dropin_dir image_dropin token_dropin
+  local homedir quadlet_dir container_file dropin_dir image_dropin icmp_dropin token_dropin
 
   homedir="$(getent passwd "$u" | awk -F: '{print $6}')"
   [[ -n "$homedir" && -d "$homedir" ]] || die "Could not determine home directory for user: $u"
@@ -260,8 +223,7 @@ EOF
 Sysctl="net.ipv4.ping_group_range=65532 65532"
 EOF
   chown "$u:$u" "$icmp_dropin"
-  chown 0600 "$icmp_dropin"
-
+  chmod 0600 "$icmp_dropin"
 
   cat >"$token_dropin" <<EOF
 [Container]
@@ -283,13 +245,11 @@ EOF
 main() {
   require_root
 
-  # Validate primary NIC presence early
   iface_exists eth0 || die "Interface eth0 not found. This script expects eth0 as the primary NIC."
 
   install_packages
 
   echo
-  # Default rootless user is "cloudflared"
   read -r -p "Enter username to run cloudflared (rootless) [cloudflared]: " CF_USER
   CF_USER="${CF_USER:-cloudflared}"
   ensure_user "${CF_USER}"
@@ -306,34 +266,33 @@ main() {
   read -r -p "Does this server have 1 or 2 network interfaces for routing? [1/2]: " NIC_COUNT
   [[ "${NIC_COUNT}" == "1" || "${NIC_COUNT}" == "2" ]] || die "Enter 1 or 2"
 
-  # New: allow user to skip IPv4 routing modifications even if 2 NICs are present
-  APPLY_IPV4_ROUTES="n"
-  ETH1_RFC1918_GW=""
+  APPLY_POLICY_ROUTING="n"
+  ETH1_IP=""
 
   if [[ "${NIC_COUNT}" == "2" ]]; then
     iface_exists eth1 || die "You selected 2 NICs, but interface eth1 was not found."
 
     echo
-    read -r -p "Apply IPv4 routing modifications for eth1 (RFC1918 routes + ensure no default on eth1)? [y/N]: " APPLY_IPV4_ROUTES
-    APPLY_IPV4_ROUTES="${APPLY_IPV4_ROUTES:-n}"
+    read -r -p "Configure origin policy routing for cloudflared using eth1? [y/N]: " APPLY_POLICY_ROUTING
+    APPLY_POLICY_ROUTING="${APPLY_POLICY_ROUTING:-n}"
 
-    if [[ "${APPLY_IPV4_ROUTES}" =~ ^[Yy]$ ]]; then
-      echo
-      read -r -p "Enter RFC1918 next-hop gateway IP to use via eth1 (e.g., 10.98.0.1): " ETH1_RFC1918_GW
-      is_ipv4 "${ETH1_RFC1918_GW}" || die "Invalid IPv4 address for RFC1918 next-hop gateway: ${ETH1_RFC1918_GW}"
+    if [[ "${APPLY_POLICY_ROUTING}" =~ ^[Yy]$ ]]; then
+      ETH1_IP="$(get_ipv4_addr_for_dev eth1 || true)"
+      [[ -n "${ETH1_IP}" ]] || die "Could not determine IPv4 address for eth1. Configure eth1 with an IPv4 address before enabling origin policy routing."
+      info "Detected eth1 IPv4 address: ${ETH1_IP}"
     else
-      info "Skipping IPv4 routing modifications as requested."
+      info "Skipping origin policy routing as requested."
     fi
   else
-    info "Single-NIC selected; skipping RFC1918 static route configuration."
+    info "Single-NIC selected; skipping origin route-table configuration."
   fi
 
   enable_persistent_journaling
   enable_linger_for_user "${CF_USER}"
   write_sysctl_cloudflared
 
-  if [[ "${NIC_COUNT}" == "2" && "${APPLY_IPV4_ROUTES}" =~ ^[Yy]$ ]]; then
-    configure_routes_two_nic "${ETH1_RFC1918_GW}"
+  if [[ "${NIC_COUNT}" == "2" && "${APPLY_POLICY_ROUTING}" =~ ^[Yy]$ ]]; then
+    configure_policy_routing_two_nic "${ETH1_IP}"
   fi
 
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
@@ -353,6 +312,10 @@ EOF
   info "Done. Verify after reboot:"
   echo "  sudo -u ${CF_USER} env XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user status cloudflared.service -l --no-pager"
   echo "  journalctl --user -u cloudflared.service -b --no-pager | tail -n 200"
+  if [[ "${NIC_COUNT}" == "2" && "${APPLY_POLICY_ROUTING}" =~ ^[Yy]$ ]]; then
+    echo "  ip rule show"
+    echo "  ip route show table origin"
+  fi
 }
 
 main "$@"
