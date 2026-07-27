@@ -4,8 +4,8 @@
 # Setup environment on Alma Linux 9 server to run rootless container for
 #  CloudflareD tunnel daemon.
 #
-# Vibe coded with ChatGPT 5.2 Thinking LLM on January 20, 2026.
-#   -- https://chatgpt.com/share/e/6965778b-c898-8001-b27d-209c0a5024f7
+# Vibe coded with Cloude Sonet 4.6 on July 27, 2026.
+#   -- https://www.perplexity.ai/search/914c5f0b-13c3-4605-a520-7f495d7792b9
 #
 # Implements:
 #  1) Install packages: podman, passt
