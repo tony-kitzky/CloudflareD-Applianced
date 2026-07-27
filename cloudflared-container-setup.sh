@@ -53,13 +53,45 @@ ensure_user() {
   local u="$1"
   if user_exists "$u"; then
     info "User exists: $u"
-    return 0
+  else
+    info "User does not exist, creating: $u"
+    useradd -m -s /bin/bash "$u"
   fi
-  info "User does not exist, creating: $u"
-  useradd -m -s /bin/bash "$u"
+  ensure_subuid_subgid "$u"
 }
 
 user_uid() { id -u "$1"; }
+
+# Ensure a user has subuid/subgid ranges allocated for rootless Podman.
+# Handles both newly created and pre-existing users. useradd normally
+# allocates these automatically via /etc/login.defs for new accounts, but
+# pre-existing accounts (the user_exists branch above) are never verified,
+# which can cause confusing rootless Podman failures later.
+ensure_subuid_subgid() {
+  local u="$1"
+  local need_subuid=1 need_subgid=1
+
+  grep -Eq "^${u}:" /etc/subuid 2>/dev/null && need_subuid=0
+  grep -Eq "^${u}:" /etc/subgid 2>/dev/null && need_subgid=0
+
+  if [[ "$need_subuid" -eq 0 && "$need_subgid" -eq 0 ]]; then
+    info "subuid/subgid already allocated for user: $u"
+    return 0
+  fi
+
+  info "Allocating missing subuid/subgid range(s) for user: $u"
+  if command -v usermod >/dev/null 2>&1; then
+    usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$u" 2>/dev/null || true
+  fi
+
+  grep -Eq "^${u}:" /etc/subuid 2>/dev/null || echo "${u}:100000:65536" >> /etc/subuid
+  grep -Eq "^${u}:" /etc/subgid 2>/dev/null || echo "${u}:100000:65536" >> /etc/subgid
+
+  grep -Eq "^${u}:" /etc/subuid 2>/dev/null || die "Failed to allocate subuid range for user: $u"
+  grep -Eq "^${u}:" /etc/subgid 2>/dev/null || die "Failed to allocate subgid range for user: $u"
+
+  info "subuid/subgid ranges confirmed for user: $u (run 'podman system migrate' as $u if the service already ran before this change)"
+}
 
 get_ipv4_addr_for_dev() {
   local dev="$1"
@@ -146,8 +178,6 @@ configure_policy_routing_two_nic() {
 
   grep -Eq "^[[:space:]]*${rt_id}[[:space:]]+${rt_name}(\\s|$)" "$rt_tables_file" 2>/dev/null || \
     echo "${rt_id} ${rt_name}" >> "$rt_tables_file"
-
-
 
   ip route replace 10.0.0.0/8 dev eth1 table "$rt_name"
   ip route replace 172.16.0.0/12 dev eth1 table "$rt_name"
