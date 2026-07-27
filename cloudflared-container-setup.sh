@@ -134,8 +134,20 @@ configure_policy_routing_two_nic() {
 
   info "Configuring policy routing for dual-NIC host using route table '${rt_name}' from source ${eth1_ip}"
 
+  if command -v nmcli >/dev/null 2>&1; then
+    local con1
+    con1="$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: '$2=="eth1" {print $1; exit}')"
+    if [[ -n "$con1" ]]; then
+      info "Removing IPv4 gateway from NetworkManager profile for eth1: ${con1}"
+      nmcli con mod "$con1" ipv4.never-default yes >/dev/null 2>&1 || true
+      nmcli con mod "$con1" -ipv4.gateway >/dev/null 2>&1 || true
+    fi
+  fi
+
   grep -Eq "^[[:space:]]*${rt_id}[[:space:]]+${rt_name}(\\s|$)" "$rt_tables_file" 2>/dev/null || \
     echo "${rt_id} ${rt_name}" >> "$rt_tables_file"
+
+
 
   ip route replace 10.0.0.0/8 dev eth1 table "$rt_name"
   ip route replace 172.16.0.0/12 dev eth1 table "$rt_name"
