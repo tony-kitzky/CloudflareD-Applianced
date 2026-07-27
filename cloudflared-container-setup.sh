@@ -215,7 +215,7 @@ pull_cloudflared_image_rootless() {
 
 create_quadlet_rootless() {
   local u="$1" tag="$2" token="$3"
-  local homedir quadlet_dir container_file dropin_dir image_dropin icmp_dropin token_dropin
+  local homedir quadlet_dir container_file dropin_dir image_dropin icmp_dropin token_dropin env_file
 
   homedir="$(getent passwd "$u" | awk -F: '{print $6}')"
   [[ -n "$homedir" && -d "$homedir" ]] || die "Could not determine home directory for user: $u"
@@ -226,6 +226,7 @@ create_quadlet_rootless() {
   image_dropin="${dropin_dir}/40-image.conf"
   icmp_dropin="${dropin_dir}/50-icmp.conf"
   token_dropin="${dropin_dir}/50-token.conf"
+  env_file="${dropin_dir}/cloudflared.env"
 
   info "Creating Quadlet files for user $u"
 
@@ -267,9 +268,20 @@ EOF
   chown "$u:$u" "$icmp_dropin"
   chmod 0600 "$icmp_dropin"
 
+  # Pass the tunnel token via environment rather than as a CLI argument.
+  # A --token CLI arg would be visible to any local user via `ps` or
+  # /proc/<pid>/cmdline (both world-readable), regardless of file
+  # permissions on this drop-in. Env vars land in /proc/<pid>/environ,
+  # which is readable only by the owning user and root.
+  cat >"$env_file" <<EOF
+TUNNEL_TOKEN=${token}
+EOF
+  chown "$u:$u" "$env_file"
+  chmod 0600 "$env_file"
+
   cat >"$token_dropin" <<EOF
 [Container]
-Exec=tunnel --no-autoupdate run --token ${token}
+EnvironmentFile=${env_file}
 
 [Service]
 LimitNOFILE=250000
