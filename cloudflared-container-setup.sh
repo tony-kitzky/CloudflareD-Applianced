@@ -327,6 +327,7 @@ resolve_cf_user() {
   QUADLET_DIR="$(user_home "$CF_USER")/.config/containers/systemd"
   DROPIN_DIR="${QUADLET_DIR}/cloudflared.container.d"
   IMAGE_DROPIN="${DROPIN_DIR}/40-image.conf"
+  TOKEN_ENV_FILE="${DROPIN_DIR}/cloudflared.env"
 
   [[ -d "$QUADLET_DIR" ]] || die "Quadlet directory not found for ${CF_USER}: ${QUADLET_DIR}"
 }
@@ -373,7 +374,33 @@ action_restart() {
 }
 
 #------------------------------------------------------------------------------
-# 3) Upgrade the cloudflared container
+# 3) Stop the cloudflared container
+#------------------------------------------------------------------------------
+action_stop() {
+  echo
+  info "Stopping cloudflared.service for user: ${CF_USER}"
+  user_systemctl "$CF_USER" stop cloudflared.service || die "Failed to stop cloudflared.service"
+
+  sleep 1
+  info "Stop complete. Current status:"
+  user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+}
+
+#------------------------------------------------------------------------------
+# 4) Start the cloudflared container
+#------------------------------------------------------------------------------
+action_start() {
+  echo
+  info "Starting cloudflared.service for user: ${CF_USER}"
+  user_systemctl "$CF_USER" start cloudflared.service || die "Failed to start cloudflared.service"
+
+  sleep 2
+  info "Start complete. Current status:"
+  user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+}
+
+#------------------------------------------------------------------------------
+# 5) Upgrade the cloudflared container
 #------------------------------------------------------------------------------
 action_upgrade() {
   [[ -f "$IMAGE_DROPIN" ]] || die "Image drop-in not found: ${IMAGE_DROPIN}"
@@ -421,6 +448,50 @@ EOF
   fi
 }
 
+#------------------------------------------------------------------------------
+# 6) Change the tunnel token
+#------------------------------------------------------------------------------
+action_change_token() {
+  [[ -f "$TOKEN_ENV_FILE" ]] || die "Token env file not found: ${TOKEN_ENV_FILE}"
+
+  echo
+  warn "The new token will be visible on screen while typing."
+  read -r -p "Enter the new tunnel token: " NEW_TOKEN
+  [[ -n "$NEW_TOKEN" ]] || die "Token cannot be empty"
+
+  info "Updating token file: ${TOKEN_ENV_FILE}"
+  cat >"${TOKEN_ENV_FILE}" <<EOF
+TUNNEL_TOKEN=${NEW_TOKEN}
+EOF
+  chown "${CF_USER}:${CF_USER}" "${TOKEN_ENV_FILE}"
+  chmod 0600 "${TOKEN_ENV_FILE}"
+
+  info "Reloading systemd --user daemon for user: ${CF_USER}"
+  user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
+
+  echo
+  read -r -p "Restart cloudflared.service now to apply the new token? [Y/n]: " do_restart
+  do_restart="${do_restart:-y}"
+  if [[ "${do_restart,,}" == "y" ]]; then
+    user_systemctl "$CF_USER" restart cloudflared.service || die "Failed to restart cloudflared.service after token change"
+    sleep 2
+    info "Token updated. Current status:"
+    user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+  else
+    warn "Token updated but service not restarted. The old token stays active until restarted."
+  fi
+}
+
+#------------------------------------------------------------------------------
+# 7) Reload the systemd --user daemon
+#------------------------------------------------------------------------------
+action_daemon_reload() {
+  echo
+  info "Running systemctl --user daemon-reload for user: ${CF_USER}"
+  user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
+  info "Daemon reload complete."
+}
+
 print_menu() {
   echo
   echo "=========================================="
@@ -428,8 +499,12 @@ print_menu() {
   echo "=========================================="
   echo "  1) Show status"
   echo "  2) Restart container"
-  echo "  3) Upgrade container (change image tag)"
-  echo "  4) Switch user"
+  echo "  3) Stop container"
+  echo "  4) Start container"
+  echo "  5) Upgrade container (change image tag)"
+  echo "  6) Change tunnel token"
+  echo "  7) Reload systemd --user daemon"
+  echo "  8) Switch to different container user"
   echo "  q) Quit"
   echo
 }
@@ -438,13 +513,18 @@ main() {
   require_root
   resolve_cf_user
 
-  # Allow non-interactive one-shot invocation: cloudflared-container status|restart|upgrade
+  # Allow non-interactive one-shot invocation:
+  #   cloudflared-container status|restart|stop|start|upgrade|change-token|daemon-reload
   if [[ "${1:-}" != "" ]]; then
     case "${1}" in
-      status)  action_status ;;
-      restart) action_restart ;;
-      upgrade) action_upgrade ;;
-      *) die "Unknown action: ${1}. Valid actions: status, restart, upgrade" ;;
+      status)        action_status ;;
+      restart)       action_restart ;;
+      stop)          action_stop ;;
+      start)         action_start ;;
+      upgrade)       action_upgrade ;;
+      change-token)  action_change_token ;;
+      daemon-reload) action_daemon_reload ;;
+      *) die "Unknown action: ${1}. Valid actions: status, restart, stop, start, upgrade, change-token, daemon-reload" ;;
     esac
     exit 0
   fi
@@ -455,8 +535,12 @@ main() {
     case "$choice" in
       1) action_status ;;
       2) action_restart ;;
-      3) action_upgrade ;;
-      4) resolve_cf_user ;;
+      3) action_stop ;;
+      4) action_start ;;
+      5) action_upgrade ;;
+      6) action_change_token ;;
+      7) action_daemon_reload ;;
+      8) resolve_cf_user ;;
       q|Q) info "Exiting."; exit 0 ;;
       *) warn "Invalid selection: ${choice}" ;;
     esac
