@@ -13,23 +13,15 @@
 #      a) username to run rootless cloudflared (create if missing) -- default: cloudflared
 #      b) cloudflared image tag
 #      c) cloudflared tunnel token (dashboard-generated)
-#      d) whether server uses 1 NIC or 2 NICs
-#      e) OPTIONAL: enable policy routing for dual-NIC origin traffic via eth1
 #  3) Enable persistent journaling + per-user journals
 #  4) Enable boot-start for user services (linger) for the cloudflared user
 #  5) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
-#  6) OPTIONAL policy routing if 2 NICs and enabled:
-#      - default remains on eth0
-#      - route-table "origin" created in /etc/iproute2/rt_tables
-#      - RFC1918 prefixes via eth1 in route-table origin
-#      - rule to lookup traffic sourced from the eth1 IPv4 address
-#      - persistence via /etc/sysconfig/network-scripts/route-eth1 and rule-eth1
-#  7) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>)
-#  8) Create Quadlet base + drop-ins
-#  9) Start the cloudflared.service (systemd --user) for the selected user
-# 10) Install /usr/local/sbin/cloudflared-container management command
+#  6) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>)
+#  7) Create Quadlet base + drop-ins
+#  8) Start the cloudflared.service (systemd --user) for the selected user
+#  9) Install /usr/local/sbin/cloudflared-container management command
 #     (menu-driven status/restart/upgrade tool; usable by any sudoer)
-# 11) Write /etc/profile.d/cloudflare-alias.sh
+# 10) Write /etc/profile.d/cloudflare-alias.sh
 #
 # Notes:
 #  - Token is stored on disk in a drop-in file (0600). Protect the user account.
@@ -95,11 +87,6 @@ ensure_subuid_subgid() {
   info "subuid/subgid ranges confirmed for user: $u (run 'podman system migrate' as $u if the service already ran before this change)"
 }
 
-get_ipv4_addr_for_dev() {
-  local dev="$1"
-  ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
-}
-
 # Run systemctl --user for a given user in non-interactive contexts.
 user_systemctl() {
   local u="$1"; shift
@@ -151,58 +138,11 @@ net.ipv4.ping_group_range = 0 65532
 net.ipv6.ping_group_range = 0 65532
 
 # QUIC UDP socket buffer ceilings (helps avoid quic-go UDP buffer warnings).
-net.core.rmem_max = 8000000
-net.core.wmem_max = 8000000
+net.core.rmem_max = 12000000
+net.core.wmem_max = 12000000
 EOF
 
   sysctl --system >/dev/null
-}
-
-configure_policy_routing_two_nic() {
-  local eth1_ip="$1"
-  local rt_name="origin"
-  local rt_id="100"
-  local rt_tables_file="/etc/iproute2/rt_tables"
-  local rules_file="/etc/sysconfig/network-scripts/rule-eth1"
-  local routes_file="/etc/sysconfig/network-scripts/route-eth1"
-
-  info "Configuring policy routing for dual-NIC host using route table '${rt_name}' from source ${eth1_ip}"
-
-  if command -v nmcli >/dev/null 2>&1; then
-    local con1
-    con1="$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: '$2=="eth1" {print $1; exit}')"
-    if [[ -n "$con1" ]]; then
-      info "Removing IPv4 gateway from NetworkManager profile for eth1: ${con1}"
-      nmcli con mod "$con1" ipv4.never-default yes >/dev/null 2>&1 || true
-      nmcli con mod "$con1" -ipv4.gateway >/dev/null 2>&1 || true
-    fi
-  fi
-
-  grep -Eq "^[[:space:]]*${rt_id}[[:space:]]+${rt_name}(\\s|$)" "$rt_tables_file" 2>/dev/null || \
-    echo "${rt_id} ${rt_name}" >> "$rt_tables_file"
-
-  ip route replace 10.0.0.0/8 dev eth1 table "$rt_name"
-  ip route replace 172.16.0.0/12 dev eth1 table "$rt_name"
-  ip route replace 192.168.0.0/16 dev eth1 table "$rt_name"
-
-  ip rule del from "$eth1_ip/32" table "$rt_name" 2>/dev/null || true
-  ip rule add from "$eth1_ip/32" table "$rt_name" priority 100
-
-  mkdir -p /etc/sysconfig/network-scripts
-  cat >"$routes_file" <<EOF
-10.0.0.0/8 dev eth1 table ${rt_name}
-172.16.0.0/12 dev eth1 table ${rt_name}
-192.168.0.0/16 dev eth1 table ${rt_name}
-EOF
-
-  cat >"$rules_file" <<EOF
-from ${eth1_ip}/32 table ${rt_name} priority 100
-EOF
-
-  info "Policy routing sanity check:"
-  ip rule show | sed 's/^/  /'
-  ip route show table "$rt_name" | sed 's/^/  /'
-  ip route get 10.1.2.3 from "$eth1_ip" | sed 's/^/  /' || true
 }
 
 pull_cloudflared_image_rootless() {
@@ -661,38 +601,9 @@ main() {
   echo
   [[ -n "${CF_TOKEN}" ]] || die "Tunnel token cannot be empty"
 
-  echo
-  read -r -p "Does this server have 1 or 2 network interfaces for routing? [1/2]: " NIC_COUNT
-  [[ "${NIC_COUNT}" == "1" || "${NIC_COUNT}" == "2" ]] || die "Enter 1 or 2"
-
-  APPLY_POLICY_ROUTING="n"
-  ETH1_IP=""
-
-  if [[ "${NIC_COUNT}" == "2" ]]; then
-    iface_exists eth1 || die "You selected 2 NICs, but interface eth1 was not found."
-
-    echo
-    read -r -p "Configure origin policy routing for cloudflared using eth1? [y/N]: " APPLY_POLICY_ROUTING
-    APPLY_POLICY_ROUTING="${APPLY_POLICY_ROUTING:-n}"
-
-    if [[ "${APPLY_POLICY_ROUTING}" =~ ^[Yy]$ ]]; then
-      ETH1_IP="$(get_ipv4_addr_for_dev eth1 || true)"
-      [[ -n "${ETH1_IP}" ]] || die "Could not determine IPv4 address for eth1. Configure eth1 with an IPv4 address before enabling origin policy routing."
-      info "Detected eth1 IPv4 address: ${ETH1_IP}"
-    else
-      info "Skipping origin policy routing as requested."
-    fi
-  else
-    info "Single-NIC selected; skipping origin route-table configuration."
-  fi
-
   enable_persistent_journaling
   enable_linger_for_user "${CF_USER}"
   write_sysctl_cloudflared
-
-  if [[ "${NIC_COUNT}" == "2" && "${APPLY_POLICY_ROUTING}" =~ ^[Yy]$ ]]; then
-    configure_policy_routing_two_nic "${ETH1_IP}"
-  fi
 
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
   create_quadlet_rootless "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}"
@@ -713,10 +624,6 @@ EOF
   info "Done. Verify after reboot:"
   echo "  sudo -u ${CF_USER} env XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user status cloudflared.service -l --no-pager"
   echo "  journalctl --user -u cloudflared.service -b --no-pager | tail -n 200"
-  if [[ "${NIC_COUNT}" == "2" && "${APPLY_POLICY_ROUTING}" =~ ^[Yy]$ ]]; then
-    echo "  ip rule show"
-    echo "  ip route show table origin"
-  fi
 }
 
 main "$@"
