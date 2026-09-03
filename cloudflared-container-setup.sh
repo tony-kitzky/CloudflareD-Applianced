@@ -9,24 +9,35 @@
 #
 # Implements:
 #  1) Install packages: podman, passt
-#  2) Prompt for:
+#  2) Prompt for the "prod" instance:
 #      a) username to run rootless cloudflared (create if missing) -- default: cloudflared
 #      b) cloudflared image tag
 #      c) cloudflared tunnel token (dashboard-generated)
-#  3) Enable persistent journaling + per-user journals
-#  4) Enable boot-start for user services (linger) for the cloudflared user
-#  5) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
-#  6) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>)
-#  7) Create Quadlet base + drop-ins
-#  8) Start the cloudflared.service (systemd --user) for the selected user
-#  9) Install /usr/local/sbin/cloudflared-container management command
-#     (menu-driven status/restart/upgrade tool; usable by any sudoer)
-# 10) Write /etc/profile.d/cloudflare-alias.sh
+#  3) OPTIONAL: prompt to also install a second "dev" instance, with its own:
+#      a) username (may reuse the prod user or be a distinct account)
+#      b) cloudflared image tag
+#      c) cloudflared tunnel token
+#  4) Enable persistent journaling + per-user journals
+#  5) Enable boot-start for user services (linger) for each instance's user
+#  6) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
+#  7) Pull cloudflared image (fully-qualified docker.io/cloudflare/cloudflared:<tag>) per instance
+#  8) Create Quadlet base + drop-ins per instance:
+#      - prod unit: cloudflared.service (container file: cloudflared.container)
+#      - dev unit:  cloudflared-dev.service (container file: cloudflared-dev.container)
+#      - dev drop-in files are suffixed "-dev" to keep them unambiguous
+#  9) Start each instance's systemd --user service
+# 10) Install a dedicated /usr/local/sbin/cloudflared-container-<instance>
+#     management command per instance (menu-driven status/restart/upgrade
+#     tool; usable by any sudoer)
+# 11) Write /etc/profile.d/cloudflare-alias.sh (aliases for both instances,
+#     if dev was installed)
 #
 # Notes:
 #  - Token is stored on disk in a drop-in file (0600). Protect the user account.
 #  - Rootless systemd user services require a working user runtime dir; the script
 #    sets XDG_RUNTIME_DIR to avoid "Failed to connect to bus: No medium found".
+#  - The "prod" and "dev" instances are independent Quadlet units and may run
+#    under the same rootless user or two different rootless users.
 #
 # Usage:
 #   sudo bash cloudflared-container-setup.sh
@@ -155,24 +166,42 @@ pull_cloudflared_image_rootless() {
   sudo -H -u "$u" bash -lc "cd '$homedir' && podman pull 'docker.io/cloudflare/cloudflared:${tag}'"
 }
 
+# Install a dedicated management command for one cloudflared instance.
+#   instance: "prod" or "dev"
+#   default_user: the rootless user this instance was just provisioned under,
+#                 used only as the initial suggested default in the prompt --
+#                 the installed command still supports switching users.
+# Installs to: /usr/local/sbin/cloudflared-container-<instance>
 install_management_command() {
-  local install_path="/usr/local/sbin/cloudflared-container"
+  local instance="$1" default_user="$2"
+  local install_path="/usr/local/sbin/cloudflared-container-${instance}"
+  local unit_base container_name
 
-  info "Installing cloudflared-container management command to: ${install_path}"
+  if [[ "$instance" == "prod" ]]; then
+    unit_base="cloudflared"
+    container_name="cloudflared"
+  else
+    unit_base="cloudflared-dev"
+    container_name="cloudflared-dev"
+  fi
+
+  info "Installing cloudflared-container-${instance} management command to: ${install_path}"
 
   cat >"${install_path}" <<'MANAGE_SCRIPT_EOF'
 #!/usr/bin/env bash
 #------------------------------------------------------------------------------
-# cloudflared-container
-# Menu-driven management tool for the rootless "cloudflared-container"
+# cloudflared-container-__INSTANCE__
+# Menu-driven management tool for the rootless "__CONTAINER_NAME__"
 # Podman Quadlet deployment created by cloudflared-container-setup.sh.
+#
+# Manages the __UNIT_BASE__.service unit (instance: __INSTANCE__) only.
 #
 # Must be run with sudo/root. Internally switches to the cloudflared user's
 # systemd --user session via XDG_RUNTIME_DIR so any sudoer can manage the
 # container without needing to log in as that user directly.
 #
 # Usage:
-#   sudo cloudflared-container
+#   sudo cloudflared-container-__INSTANCE__
 #------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -181,7 +210,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "INFO: $*" >&2; }
 warn() { echo "WARN: $*" >&2; }
 
-require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo cloudflared-container"; }
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo cloudflared-container-__INSTANCE__"; }
 
 user_exists() { id "$1" >/dev/null 2>&1; }
 
@@ -223,16 +252,16 @@ user_run() {
   sudo -H -u "$u" env XDG_RUNTIME_DIR="$runtime_dir" bash -lc "cd '$homedir' && $*"
 }
 
-# Try to auto-detect the user running the cloudflared Quadlet service by
-# scanning systemd --user sessions for anyone with a cloudflared.service
-# unit loaded. Falls back to "cloudflared" if detection is inconclusive.
+# Try to auto-detect the user running this instance's cloudflared Quadlet
+# service by scanning for anyone with the instance's Quadlet container file.
+# Falls back to "cloudflared" if detection is inconclusive.
 detect_cloudflared_user() {
   local candidate
 
-  # Prefer an explicit match: any home directory with the Quadlet container
-  # file this setup writes.
+  # Prefer an explicit match: any home directory with this instance's
+  # Quadlet container file.
   for pw_home in $(getent passwd | awk -F: '{print $6}'); do
-    if [[ -f "${pw_home}/.config/containers/systemd/cloudflared.container" ]]; then
+    if [[ -f "${pw_home}/.config/containers/systemd/__UNIT_BASE__.container" ]]; then
       candidate="$(getent passwd | awk -F: -v h="$pw_home" '$6==h {print $1; exit}')"
       if [[ -n "$candidate" ]]; then
         echo "$candidate"
@@ -255,88 +284,88 @@ resolve_cf_user() {
   detected="$(detect_cloudflared_user || true)"
 
   if [[ -n "$detected" ]]; then
-    read -r -p "Username running cloudflared [${detected}]: " CF_USER
+    read -r -p "Username running __INSTANCE__ cloudflared [${detected}]: " CF_USER
     CF_USER="${CF_USER:-$detected}"
   else
-    read -r -p "Username running cloudflared: " CF_USER
+    read -r -p "Username running __INSTANCE__ cloudflared: " CF_USER
     [[ -n "$CF_USER" ]] || die "Username cannot be empty"
   fi
 
   user_exists "$CF_USER" || die "User '${CF_USER}' does not exist on this system"
 
   QUADLET_DIR="$(user_home "$CF_USER")/.config/containers/systemd"
-  DROPIN_DIR="${QUADLET_DIR}/cloudflared.container.d"
-  IMAGE_DROPIN="${DROPIN_DIR}/40-image.conf"
-  TOKEN_ENV_FILE="${DROPIN_DIR}/cloudflared.env"
+  DROPIN_DIR="${QUADLET_DIR}/__UNIT_BASE__.container.d"
+  IMAGE_DROPIN="${DROPIN_DIR}/__IMAGE_DROPIN_NAME__"
+  TOKEN_ENV_FILE="${DROPIN_DIR}/__TOKEN_ENV_NAME__"
 
   [[ -d "$QUADLET_DIR" ]] || die "Quadlet directory not found for ${CF_USER}: ${QUADLET_DIR}"
 }
 
 #------------------------------------------------------------------------------
-# 1) Show cloudflared container status
+# 1) Show cloudflared container status (instance: __INSTANCE__)
 #------------------------------------------------------------------------------
 action_status() {
   echo
   info "== podman status (as user: ${CF_USER}) =="
-  user_run "$CF_USER" "podman ps -a --filter name=cloudflared" || warn "Failed to list podman containers"
+  user_run "$CF_USER" "podman ps -a --filter name=__CONTAINER_NAME__" || warn "Failed to list podman containers"
 
   echo
-  user_run "$CF_USER" "podman inspect cloudflared --format 'State: {{.State.Status}}  |  Started: {{.State.StartedAt}}  |  Image: {{.Config.Image}}'" 2>/dev/null || \
-    warn "Could not inspect 'cloudflared' container (it may not be running)"
+  user_run "$CF_USER" "podman inspect __CONTAINER_NAME__ --format 'State: {{.State.Status}}  |  Started: {{.State.StartedAt}}  |  Image: {{.Config.Image}}'" 2>/dev/null || \
+    warn "Could not inspect '__CONTAINER_NAME__' container (it may not be running)"
 
   echo
-  info "== systemctl --user status cloudflared.container (as user: ${CF_USER}) =="
-  user_systemctl "$CF_USER" status cloudflared.container -l --no-pager || \
-    warn "Could not read systemctl --user status for cloudflared.container"
+  info "== systemctl --user status __UNIT_BASE__.container (as user: ${CF_USER}) =="
+  user_systemctl "$CF_USER" status __UNIT_BASE__.container -l --no-pager || \
+    warn "Could not read systemctl --user status for __UNIT_BASE__.container"
 
   echo
   info "== Recent journal (last 30 lines) =="
-  if user_systemctl "$CF_USER" list-units cloudflared.service >/dev/null 2>&1; then
+  if user_systemctl "$CF_USER" list-units __UNIT_BASE__.service >/dev/null 2>&1; then
     sudo -u "$CF_USER" env XDG_RUNTIME_DIR="/run/user/$(user_uid "$CF_USER")" \
-      journalctl --user -u cloudflared.service -n 30 --no-pager 2>/dev/null || \
+      journalctl --user -u __UNIT_BASE__.service -n 30 --no-pager 2>/dev/null || \
       warn "Could not read recent journal entries"
   else
-    warn "cloudflared.service unit not found; skipping journal output"
+    warn "__UNIT_BASE__.service unit not found; skipping journal output"
   fi
 }
 
 #------------------------------------------------------------------------------
-# 2) Restart the cloudflared container
+# 2) Restart the cloudflared container (instance: __INSTANCE__)
 #------------------------------------------------------------------------------
 action_restart() {
   echo
-  info "Restarting cloudflared.service for user: ${CF_USER}"
-  user_systemctl "$CF_USER" restart cloudflared.service || die "Failed to restart cloudflared.service"
+  info "Restarting __UNIT_BASE__.service for user: ${CF_USER}"
+  user_systemctl "$CF_USER" restart __UNIT_BASE__.service || die "Failed to restart __UNIT_BASE__.service"
 
   sleep 2
   info "Restart complete. Current status:"
-  user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+  user_systemctl "$CF_USER" status __UNIT_BASE__.service -l --no-pager || true
 }
 
 #------------------------------------------------------------------------------
-# 3) Stop the cloudflared container
+# 3) Stop the cloudflared container (instance: __INSTANCE__)
 #------------------------------------------------------------------------------
 action_stop() {
   echo
-  info "Stopping cloudflared.service for user: ${CF_USER}"
-  user_systemctl "$CF_USER" stop cloudflared.service || die "Failed to stop cloudflared.service"
+  info "Stopping __UNIT_BASE__.service for user: ${CF_USER}"
+  user_systemctl "$CF_USER" stop __UNIT_BASE__.service || die "Failed to stop __UNIT_BASE__.service"
 
   sleep 1
   info "Stop complete. Current status:"
-  user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+  user_systemctl "$CF_USER" status __UNIT_BASE__.service -l --no-pager || true
 }
 
 #------------------------------------------------------------------------------
-# 4) Start the cloudflared container
+# 4) Start the cloudflared container (instance: __INSTANCE__)
 #------------------------------------------------------------------------------
 action_start() {
   echo
-  info "Starting cloudflared.service for user: ${CF_USER}"
-  user_systemctl "$CF_USER" start cloudflared.service || die "Failed to start cloudflared.service"
+  info "Starting __UNIT_BASE__.service for user: ${CF_USER}"
+  user_systemctl "$CF_USER" start __UNIT_BASE__.service || die "Failed to start __UNIT_BASE__.service"
 
   sleep 2
   info "Start complete. Current status:"
-  user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+  user_systemctl "$CF_USER" status __UNIT_BASE__.service -l --no-pager || true
 }
 
 #------------------------------------------------------------------------------
@@ -376,20 +405,20 @@ EOF
   user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
 
   echo
-  read -r -p "Restart cloudflared.service now to apply the new image? [Y/n]: " do_restart
+  read -r -p "Restart __UNIT_BASE__.service now to apply the new image? [Y/n]: " do_restart
   do_restart="${do_restart:-y}"
   if [[ "${do_restart,,}" == "y" ]]; then
-    user_systemctl "$CF_USER" restart cloudflared.service || die "Failed to restart cloudflared.service after upgrade"
+    user_systemctl "$CF_USER" restart __UNIT_BASE__.service || die "Failed to restart __UNIT_BASE__.service after upgrade"
     sleep 2
     info "Upgrade complete. Current status:"
-    user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+    user_systemctl "$CF_USER" status __UNIT_BASE__.service -l --no-pager || true
   else
     warn "Image updated but service not restarted. The old container keeps running the previous image until restarted."
   fi
 }
 
 #------------------------------------------------------------------------------
-# 6) Change the tunnel token
+# 6) Change the tunnel token (instance: __INSTANCE__)
 #------------------------------------------------------------------------------
 action_change_token() {
   [[ -f "$TOKEN_ENV_FILE" ]] || die "Token env file not found: ${TOKEN_ENV_FILE}"
@@ -410,13 +439,13 @@ EOF
   user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
 
   echo
-  read -r -p "Restart cloudflared.service now to apply the new token? [Y/n]: " do_restart
+  read -r -p "Restart __UNIT_BASE__.service now to apply the new token? [Y/n]: " do_restart
   do_restart="${do_restart:-y}"
   if [[ "${do_restart,,}" == "y" ]]; then
-    user_systemctl "$CF_USER" restart cloudflared.service || die "Failed to restart cloudflared.service after token change"
+    user_systemctl "$CF_USER" restart __UNIT_BASE__.service || die "Failed to restart __UNIT_BASE__.service after token change"
     sleep 2
     info "Token updated. Current status:"
-    user_systemctl "$CF_USER" status cloudflared.service -l --no-pager || true
+    user_systemctl "$CF_USER" status __UNIT_BASE__.service -l --no-pager || true
   else
     warn "Token updated but service not restarted. The old token stays active until restarted."
   fi
@@ -435,7 +464,7 @@ action_daemon_reload() {
 print_menu() {
   echo
   echo "=========================================="
-  echo " cloudflared-container management (user: ${CF_USER})"
+  echo " cloudflared-container-__INSTANCE__ management (user: ${CF_USER})"
   echo "=========================================="
   echo "  1) Show status"
   echo "  2) Restart container"
@@ -454,7 +483,7 @@ main() {
   resolve_cf_user
 
   # Allow non-interactive one-shot invocation:
-  #   cloudflared-container status|restart|stop|start|upgrade|change-token|daemon-reload
+  #   cloudflared-container-__INSTANCE__ status|restart|stop|start|upgrade|change-token|daemon-reload
   if [[ "${1:-}" != "" ]]; then
     case "${1}" in
       status)        action_status ;;
@@ -490,42 +519,82 @@ main() {
 main "$@"
 MANAGE_SCRIPT_EOF
 
+  # Bake this instance's fixed identifiers into the otherwise-generic
+  # embedded script. The heredoc above is single-quoted (no shell
+  # expansion at write time) so the __TOKEN__ placeholders land in the
+  # file literally; substitute them now for this specific instance.
+  local image_dropin_name token_env_name
+  if [[ "$instance" == "prod" ]]; then
+    image_dropin_name="40-image.conf"
+    token_env_name="cloudflared.env"
+  else
+    image_dropin_name="40-image-dev.conf"
+    token_env_name="cloudflared-dev.env"
+  fi
+
+  sed -i \
+    -e "s/__INSTANCE__/${instance}/g" \
+    -e "s/__UNIT_BASE__/${unit_base}/g" \
+    -e "s/__CONTAINER_NAME__/${container_name}/g" \
+    -e "s/__IMAGE_DROPIN_NAME__/${image_dropin_name}/g" \
+    -e "s/__TOKEN_ENV_NAME__/${token_env_name}/g" \
+    "${install_path}"
+
   chmod 0755 "${install_path}"
   chown root:root "${install_path}"
 
   info "Management command installed: ${install_path}"
-  info "  Run interactively: sudo cloudflared-container"
-  info "  Or non-interactively: sudo cloudflared-container status|restart|upgrade"
+  info "  Run interactively: sudo cloudflared-container-${instance}"
+  info "  Or non-interactively: sudo cloudflared-container-${instance} status|restart|upgrade"
+  # default_user is accepted for symmetry/future use (e.g. pre-seeding a
+  # config file); resolve_cf_user() re-detects the user at runtime instead.
+  : "${default_user}"
 }
 
+# Create the Quadlet unit + drop-ins for one cloudflared instance.
+#   instance: "prod" or "dev"
+#     - prod uses unit basename "cloudflared" (unit: cloudflared.service)
+#     - dev uses unit basename "cloudflared-dev" (unit: cloudflared-dev.service)
+#       and all drop-in filenames are suffixed "-dev"
 create_quadlet_rootless() {
-  local u="$1" tag="$2" token="$3"
-  local homedir quadlet_dir container_file dropin_dir image_dropin icmp_dropin token_dropin env_file
+  local instance="$1" u="$2" tag="$3" token="$4"
+  local homedir quadlet_dir unit_base container_name container_file dropin_dir
+  local image_dropin icmp_dropin token_dropin env_file suffix
 
   homedir="$(getent passwd "$u" | awk -F: '{print $6}')"
   [[ -n "$homedir" && -d "$homedir" ]] || die "Could not determine home directory for user: $u"
 
-  quadlet_dir="${homedir}/.config/containers/systemd"
-  container_file="${quadlet_dir}/cloudflared.container"
-  dropin_dir="${quadlet_dir}/cloudflared.container.d"
-  image_dropin="${dropin_dir}/40-image.conf"
-  icmp_dropin="${dropin_dir}/50-icmp.conf"
-  token_dropin="${dropin_dir}/50-token.conf"
-  env_file="${dropin_dir}/cloudflared.env"
+  if [[ "$instance" == "prod" ]]; then
+    unit_base="cloudflared"
+    container_name="cloudflared"
+    suffix=""
+  else
+    unit_base="cloudflared-dev"
+    container_name="cloudflared-dev"
+    suffix="-dev"
+  fi
 
-  info "Creating Quadlet files for user $u"
+  quadlet_dir="${homedir}/.config/containers/systemd"
+  container_file="${quadlet_dir}/${unit_base}.container"
+  dropin_dir="${quadlet_dir}/${unit_base}.container.d"
+  image_dropin="${dropin_dir}/40-image${suffix}.conf"
+  icmp_dropin="${dropin_dir}/50-icmp${suffix}.conf"
+  token_dropin="${dropin_dir}/50-token${suffix}.conf"
+  env_file="${dropin_dir}/cloudflared${suffix}.env"
+
+  info "Creating Quadlet files for instance '${instance}' (unit: ${unit_base}.service) under user $u"
 
   install -d -m 0700 -o "$u" -g "$u" "$quadlet_dir"
   install -d -m 0700 -o "$u" -g "$u" "$dropin_dir"
 
-  cat >"$container_file" <<'EOF'
+  cat >"$container_file" <<EOF
 [Unit]
-Description=CloudflareD Tunnel Agent (cloudflared) Container
+Description=CloudflareD Tunnel Agent (cloudflared) Container -- ${instance}
 Wants=network-online.target
 After=network-online.target
 
 [Container]
-ContainerName=cloudflared
+ContainerName=${container_name}
 Exec=tunnel --no-autoupdate run
 
 [Service]
@@ -576,9 +645,24 @@ EOF
 
   info "Reloading generator and starting service as user $u"
   user_systemctl "$u" daemon-reload
-  user_systemctl "$u" reset-failed cloudflared.service || true
-  user_systemctl "$u" start cloudflared.service
-  user_systemctl "$u" status cloudflared.service -l --no-pager || true
+  user_systemctl "$u" reset-failed "${unit_base}.service" || true
+  user_systemctl "$u" start "${unit_base}.service"
+  user_systemctl "$u" status "${unit_base}.service" -l --no-pager || true
+}
+
+# Append profile.d alias definitions for one instance to the shared
+# aliases file. unit_base/alias_suffix let prod keep unsuffixed alias
+# names (cloudflared-status) while dev gets "-dev" suffixed names
+# (cloudflared-status-dev), avoiding collisions when both are installed.
+write_cloudflared_aliases() {
+  local instance_user="$1" unit_base="$2" alias_suffix="$3"
+
+  cat >>/etc/profile.d/cloudflared-aliases.sh <<EOF
+alias cloudflared-status${alias_suffix}='sudo -u ${instance_user} XDG_RUNTIME_DIR=/run/user/\$(id -u ${instance_user}) systemctl --user status ${unit_base}.service'
+alias cloudflared-stop${alias_suffix}='sudo -u ${instance_user} XDG_RUNTIME_DIR=/run/user/\$(id -u ${instance_user}) systemctl --user stop ${unit_base}.service'
+alias cloudflared-start${alias_suffix}='sudo -u ${instance_user} XDG_RUNTIME_DIR=/run/user/\$(id -u ${instance_user}) systemctl --user start ${unit_base}.service'
+alias cloudflared-restart${alias_suffix}='sudo -u ${instance_user} XDG_RUNTIME_DIR=/run/user/\$(id -u ${instance_user}) systemctl --user restart ${unit_base}.service'
+EOF
 }
 
 main() {
@@ -588,42 +672,94 @@ main() {
 
   install_packages
 
+  #-----------------------------------------------------------------------
+  # "prod" instance (always installed)
+  #-----------------------------------------------------------------------
   echo
-  read -r -p "Enter username to run cloudflared (rootless) [cloudflared]: " CF_USER
+  info "Configuring the 'prod' cloudflared container"
+  read -r -p "Enter username to run prod cloudflared (rootless) [cloudflared]: " CF_USER
   CF_USER="${CF_USER:-cloudflared}"
   ensure_user "${CF_USER}"
 
-  read -r -p "Enter cloudflared image tag (e.g., 2025.11.1): " CF_TAG
+  read -r -p "Enter prod cloudflared image tag (e.g., 2025.11.1): " CF_TAG
   [[ -n "${CF_TAG}" ]] || die "Image tag cannot be empty"
 
   echo
-  read -r -s -p "Enter Cloudflare tunnel token (dashboard-generated): " CF_TOKEN
+  read -r -s -p "Enter prod Cloudflare tunnel token (dashboard-generated): " CF_TOKEN
   echo
   [[ -n "${CF_TOKEN}" ]] || die "Tunnel token cannot be empty"
 
   enable_persistent_journaling
-  enable_linger_for_user "${CF_USER}"
   write_sysctl_cloudflared
 
+  enable_linger_for_user "${CF_USER}"
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
-  create_quadlet_rootless "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}"
+  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}"
+  install_management_command "prod" "${CF_USER}"
 
-  install_management_command
+  #-----------------------------------------------------------------------
+  # "dev" instance (optional)
+  #-----------------------------------------------------------------------
+  echo
+  read -r -p "Install a second (dev) cloudflared container? [y/N]: " INSTALL_DEV
+  INSTALL_DEV="${INSTALL_DEV:-n}"
 
+  local DEV_USER=""
+  if [[ "${INSTALL_DEV,,}" == "y" ]]; then
+    info "Configuring the 'dev' cloudflared container"
+
+    read -r -p "Does the dev container need a second (different) userid than '${CF_USER}'? [y/N]: " NEED_SECOND_USER
+    NEED_SECOND_USER="${NEED_SECOND_USER:-n}"
+
+    if [[ "${NEED_SECOND_USER,,}" == "y" ]]; then
+      read -r -p "Enter username to run dev cloudflared (rootless) [cloudflared-dev]: " DEV_USER
+      DEV_USER="${DEV_USER:-cloudflared-dev}"
+      ensure_user "${DEV_USER}"
+    else
+      DEV_USER="${CF_USER}"
+      info "Dev container will run under the same user as prod: ${DEV_USER}"
+    fi
+
+    read -r -p "Enter dev cloudflared image tag (e.g., 2025.11.1): " DEV_TAG
+    [[ -n "${DEV_TAG}" ]] || die "Image tag cannot be empty"
+
+    echo
+    read -r -s -p "Enter dev Cloudflare tunnel token (dashboard-generated): " DEV_TOKEN
+    echo
+    [[ -n "${DEV_TOKEN}" ]] || die "Tunnel token cannot be empty"
+
+    enable_linger_for_user "${DEV_USER}"
+    pull_cloudflared_image_rootless "${DEV_USER}" "${DEV_TAG}"
+    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}"
+    install_management_command "dev" "${DEV_USER}"
+  else
+    info "Skipping dev container installation."
+  fi
+
+  #-----------------------------------------------------------------------
+  # Shared profile.d aliases
+  #-----------------------------------------------------------------------
   info "Installing cloudflared aliases for user ${CF_USER}"
+  : >/etc/profile.d/cloudflared-aliases.sh
+  write_cloudflared_aliases "${CF_USER}" "cloudflared" ""
 
-  cat >/etc/profile.d/cloudflared-aliases.sh <<EOF
-alias cloudflared-status='sudo -u ${CF_USER} XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user status cloudflared.service'
-alias cloudflared-stop='sudo -u ${CF_USER} XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user stop cloudflared.service'
-alias cloudflared-start='sudo -u ${CF_USER} XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user start cloudflared.service'
-alias cloudflared-restart='sudo -u ${CF_USER} XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user restart cloudflared.service'
-EOF
+  if [[ "${INSTALL_DEV,,}" == "y" ]]; then
+    info "Installing dev cloudflared aliases for user ${DEV_USER}"
+    write_cloudflared_aliases "${DEV_USER}" "cloudflared-dev" "-dev"
+  fi
 
   chmod 0644 /etc/profile.d/cloudflared-aliases.sh
 
   info "Done. Verify after reboot:"
   echo "  sudo -u ${CF_USER} env XDG_RUNTIME_DIR=/run/user/\$(id -u ${CF_USER}) systemctl --user status cloudflared.service -l --no-pager"
   echo "  journalctl --user -u cloudflared.service -b --no-pager | tail -n 200"
+  echo "  Manage prod: sudo cloudflared-container-prod"
+
+  if [[ "${INSTALL_DEV,,}" == "y" ]]; then
+    echo "  sudo -u ${DEV_USER} env XDG_RUNTIME_DIR=/run/user/\$(id -u ${DEV_USER}) systemctl --user status cloudflared-dev.service -l --no-pager"
+    echo "  journalctl --user -u cloudflared-dev.service -b --no-pager | tail -n 200"
+    echo "  Manage dev: sudo cloudflared-container-dev"
+  fi
 }
 
 main "$@"
