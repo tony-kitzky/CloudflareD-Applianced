@@ -5,12 +5,16 @@
 # Alma Linux 9 server running rootless cloudflared via Podman Quadlet.
 #
 # This script mirrors cloudflared-container-setup.sh step for step and
-# reverses only what that script actually does:
-#  1) Stop, disable, and remove the cloudflared.service + Quadlet files
-#     (base container unit, image/icmp/token drop-ins, token env file)
-#  2) Remove the cloudflared container and pulled image(s)
-#  3) Disable linger for the cloudflared user
+# reverses only what that script actually does. The "prod" instance is
+# always processed; the "dev" instance (cloudflared-dev.service and its
+# -dev-suffixed Quadlet/drop-in files) is processed too if you confirm it
+# was installed:
+#  1) Stop, disable, and remove the cloudflared[-dev].service + Quadlet
+#     files (base container unit, image/icmp/token drop-ins, token env file)
+#  2) Remove the cloudflared[-dev] container and pulled image(s)
+#  3) Disable linger for the instance's user
 #  4) Remove /etc/sysctl.d/99-cloudflared.conf (ping_group_range, UDP buffers)
+#     -- shared by both instances, removed once
 #  5) OPTIONAL policy routing rollback (only if it was configured):
 #      - remove ip rule for traffic sourced from the eth1 IPv4 address
 #      - remove RFC1918 routes from route-table "origin" on eth1
@@ -21,12 +25,15 @@
 #        eligibility, i.e. undo ipv4.never-default yes / gateway removal)
 #  6) Remove /etc/systemd/journald.conf.d/99-persistent.conf (persistent
 #     journaling) and restart journald if requested
-#  7) Remove /etc/profile.d/cloudflared-aliases.sh
-#  8) Remove /usr/local/sbin/cloudflared-container management command
-#  9) Remove subuid/subgid ranges this setup allocated for the cloudflared
-#     user (only the range the setup script adds: 100000-165535), IF the
-#     user account itself is not being kept for other purposes
-# 10) OPTIONAL: remove the cloudflared user account and home directory
+#  7) Remove /etc/profile.d/cloudflared-aliases.sh (contains both prod and
+#     dev aliases, if dev was installed; removed once)
+#  8) Remove /usr/local/sbin/cloudflared-container-prod and, if dev was
+#     installed, /usr/local/sbin/cloudflared-container-dev
+#  9) Remove subuid/subgid ranges this setup allocated (only the range the
+#     setup script adds: 100000-165535), IF each instance's user account is
+#     not being kept for other purposes. If prod and dev share the same
+#     user, this is only done once for that user.
+# 10) OPTIONAL: remove the instance user account(s) and home directory
 #
 # What this script deliberately does NOT touch:
 #  - Packages installed by setup (podman, passt) -- shared system packages,
@@ -95,22 +102,26 @@ user_home() {
 
 #------------------------------------------------------------------------------
 # 1) Stop, disable, and remove the cloudflared service + Quadlet files
+#    instance: "prod" (unit base "cloudflared") or "dev" (unit base
+#    "cloudflared-dev", all drop-ins suffixed "-dev")
 #------------------------------------------------------------------------------
 stop_disable_and_remove_service() {
-  local u="$1"
+  local instance="$1" u="$2"
+  local unit_base
+  [[ "$instance" == "prod" ]] && unit_base="cloudflared" || unit_base="cloudflared-dev"
 
   if ! user_exists "$u"; then
-    warn "User $u does not exist; skipping service stop/removal"
+    warn "User $u does not exist; skipping ${instance} service stop/removal"
     return 0
   fi
 
-  info "Stopping and disabling cloudflared.service for user: $u"
+  info "Stopping and disabling ${unit_base}.service (instance: ${instance}) for user: $u"
 
-  if user_service_exists "$u" cloudflared.service; then
-    user_systemctl "$u" stop cloudflared.service 2>/dev/null || warn "Failed to stop cloudflared.service"
-    user_systemctl "$u" disable cloudflared.service 2>/dev/null || warn "Failed to disable cloudflared.service"
+  if user_service_exists "$u" "${unit_base}.service"; then
+    user_systemctl "$u" stop "${unit_base}.service" 2>/dev/null || warn "Failed to stop ${unit_base}.service"
+    user_systemctl "$u" disable "${unit_base}.service" 2>/dev/null || warn "Failed to disable ${unit_base}.service"
   else
-    warn "cloudflared.service not found for user $u (may already be removed)"
+    warn "${unit_base}.service not found for user $u (may already be removed)"
   fi
 
   local homedir quadlet_dir
@@ -122,30 +133,34 @@ stop_disable_and_remove_service() {
 
   quadlet_dir="${homedir}/.config/containers/systemd"
 
-  if [[ -d "$quadlet_dir" ]]; then
-    info "Removing Quadlet files from: $quadlet_dir"
+  if [[ -d "${quadlet_dir}/${unit_base}.container.d" || -f "${quadlet_dir}/${unit_base}.container" ]]; then
+    info "Removing Quadlet files for instance '${instance}' from: $quadlet_dir"
     # Matches exactly what create_quadlet_rootless() in setup writes:
-    #   cloudflared.container, cloudflared.container.d/{40-image,50-icmp,50-token}.conf,
-    #   cloudflared.container.d/cloudflared.env
-    rm -f "${quadlet_dir}/cloudflared.container"
-    rm -rf "${quadlet_dir}/cloudflared.container.d"
+    #   <unit_base>.container, <unit_base>.container.d/{40-image,50-icmp,50-token}[-dev].conf,
+    #   <unit_base>.container.d/cloudflared[-dev].env
+    rm -f "${quadlet_dir}/${unit_base}.container"
+    rm -rf "${quadlet_dir}/${unit_base}.container.d"
   else
-    warn "Quadlet directory not found: $quadlet_dir (may already be removed)"
+    warn "Quadlet files for instance '${instance}' not found under $quadlet_dir (may already be removed)"
   fi
 
   info "Reloading systemd --user daemon for: $u"
   user_systemctl "$u" daemon-reload 2>/dev/null || warn "Failed to reload user daemon for $u"
-  user_systemctl "$u" reset-failed cloudflared.service 2>/dev/null || true
+  user_systemctl "$u" reset-failed "${unit_base}.service" 2>/dev/null || true
 }
 
 #------------------------------------------------------------------------------
 # 2) Remove the cloudflared container and pulled image(s)
+#    instance: "prod" (container name "cloudflared") or "dev" (container
+#    name "cloudflared-dev")
 #------------------------------------------------------------------------------
 remove_container_and_image() {
-  local u="$1" tag="${2:-}"
+  local instance="$1" u="$2" tag="${3:-}"
+  local container_name
+  [[ "$instance" == "prod" ]] && container_name="cloudflared" || container_name="cloudflared-dev"
 
   if ! user_exists "$u"; then
-    warn "User $u does not exist; skipping container/image removal"
+    warn "User $u does not exist; skipping ${instance} container/image removal"
     return 0
   fi
 
@@ -156,11 +171,11 @@ remove_container_and_image() {
     return 0
   fi
 
-  info "Removing cloudflared container for user: $u"
-  sudo -H -u "$u" bash -lc "cd '$homedir' && podman rm -f cloudflared" >/dev/null 2>&1 || \
-    warn "No running/stopped 'cloudflared' container found (or removal failed)"
+  info "Removing ${container_name} container for user: $u"
+  sudo -H -u "$u" bash -lc "cd '$homedir' && podman rm -f ${container_name}" >/dev/null 2>&1 || \
+    warn "No running/stopped '${container_name}' container found (or removal failed)"
 
-  info "Removing pulled cloudflared image(s) for user: $u"
+  info "Removing pulled cloudflared image(s) for user: $u (instance: ${instance})"
   if [[ -n "$tag" ]]; then
     sudo -H -u "$u" bash -lc "cd '$homedir' && podman rmi -f 'docker.io/cloudflare/cloudflared:${tag}'" >/dev/null 2>&1 || \
       warn "Image docker.io/cloudflare/cloudflared:${tag} not found (or removal failed)"
@@ -322,11 +337,12 @@ remove_cloudflared_aliases() {
 }
 
 #------------------------------------------------------------------------------
-# 8) Remove the /usr/local/sbin/cloudflared-container management command
-#    installed by cloudflared-container-setup.sh
+# 8) Remove the /usr/local/sbin/cloudflared-container-<instance> management
+#    command installed by cloudflared-container-setup.sh
 #------------------------------------------------------------------------------
 remove_management_command() {
-  local install_path="/usr/local/sbin/cloudflared-container"
+  local instance="$1"
+  local install_path="/usr/local/sbin/cloudflared-container-${instance}"
 
   if [[ -f "$install_path" ]]; then
     info "Removing management command: $install_path"
@@ -373,6 +389,24 @@ remove_user_account() {
   userdel -r "$u" 2>/dev/null || warn "Failed to fully remove user $u (may have running processes; check 'loginctl' / 'ps')"
 }
 
+# Remove subuid/subgid range and optionally the user account for one
+# instance's user, but only once per distinct username -- if prod and dev
+# share the same user, calling this twice for that user would be harmless
+# but redundant/confusing in output, so callers pass an already-deduped list.
+remove_user_state_if_requested() {
+  local u="$1" remove_user="$2"
+
+  if [[ "$remove_user" == "y" ]]; then
+    # userdel -r deletes the home directory and, on most distros, the
+    # associated subuid/subgid entries. Run the explicit removal first
+    # in case that behavior differs.
+    remove_subuid_subgid_range "${u}"
+    remove_user_account "${u}"
+  else
+    info "Keeping user account: ${u} (leaving subuid/subgid range intact for future rootless use)"
+  fi
+}
+
 main() {
   require_root
 
@@ -383,14 +417,39 @@ main() {
   echo "This reverses the changes made by cloudflared-container-setup.sh."
   echo
 
-  read -r -p "Enter the username that runs cloudflared [cloudflared]: " CF_USER
+  #-----------------------------------------------------------------------
+  # "prod" instance (always processed)
+  #-----------------------------------------------------------------------
+  info "Configuring removal of the 'prod' cloudflared container"
+  read -r -p "Enter the username that runs prod cloudflared [cloudflared]: " CF_USER
   CF_USER="${CF_USER:-cloudflared}"
 
   if ! user_exists "${CF_USER}"; then
     warn "User ${CF_USER} does not exist. Steps tied to that user will be skipped."
   fi
 
-  read -r -p "Enter the cloudflared image tag to remove (leave blank to remove all cloudflared images): " CF_TAG
+  read -r -p "Enter the prod cloudflared image tag to remove (leave blank to remove all cloudflared images): " CF_TAG
+
+  #-----------------------------------------------------------------------
+  # "dev" instance (optional)
+  #-----------------------------------------------------------------------
+  echo
+  read -r -p "Was a second (dev) cloudflared container installed on this host? [y/N]: " REMOVE_DEV
+  REMOVE_DEV="${REMOVE_DEV,,}"
+
+  DEV_USER=""
+  DEV_TAG=""
+  if [[ "$REMOVE_DEV" == "y" ]]; then
+    info "Configuring removal of the 'dev' cloudflared container"
+    read -r -p "Enter the username that runs dev cloudflared [${CF_USER}]: " DEV_USER
+    DEV_USER="${DEV_USER:-$CF_USER}"
+
+    if ! user_exists "${DEV_USER}"; then
+      warn "User ${DEV_USER} does not exist. Steps tied to that user will be skipped."
+    fi
+
+    read -r -p "Enter the dev cloudflared image tag to remove (leave blank to remove all cloudflared images): " DEV_TAG
+  fi
 
   echo
   read -r -p "Was dual-NIC origin policy routing configured on this host? [y/N]: " TWO_NIC_ROUTING
@@ -417,16 +476,24 @@ main() {
   echo "Starting uninstall..."
   echo
 
-  # 1. Stop, disable, and remove the service + Quadlet files
-  stop_disable_and_remove_service "${CF_USER}"
+  # 1/2. Stop/disable/remove service + Quadlet files, container, and image(s) -- prod
+  stop_disable_and_remove_service "prod" "${CF_USER}"
+  remove_container_and_image "prod" "${CF_USER}" "${CF_TAG}"
 
-  # 2. Remove container and image(s)
-  remove_container_and_image "${CF_USER}" "${CF_TAG}"
+  # 1/2. Same steps for dev, if requested
+  if [[ "$REMOVE_DEV" == "y" ]]; then
+    echo
+    stop_disable_and_remove_service "dev" "${DEV_USER}"
+    remove_container_and_image "dev" "${DEV_USER}" "${DEV_TAG}"
+  fi
 
-  # 3. Disable linger
+  # 3. Disable linger (once per distinct user)
   disable_linger_for_user "${CF_USER}"
+  if [[ "$REMOVE_DEV" == "y" && "${DEV_USER}" != "${CF_USER}" ]]; then
+    disable_linger_for_user "${DEV_USER}"
+  fi
 
-  # 4. Remove sysctl config
+  # 4. Remove sysctl config (shared, once)
   remove_sysctl_cloudflared
 
   # 5. Reverse policy routing, only if it was configured
@@ -447,24 +514,32 @@ main() {
     info "Keeping persistent journaling configuration"
   fi
 
-  # 7. Remove shell aliases
+  # 7. Remove shell aliases (single shared file covers both instances)
   remove_cloudflared_aliases
 
-  # 8. Remove the cloudflared-container management command
-  remove_management_command
+  # 8. Remove the cloudflared-container-<instance> management command(s)
+  remove_management_command "prod"
+  if [[ "$REMOVE_DEV" == "y" ]]; then
+    remove_management_command "dev"
+  fi
 
   # 9/10. subuid/subgid + optional user removal
   echo
   read -r -p "Remove user account '${CF_USER}' and home directory? [y/N]: " REMOVE_USER
   REMOVE_USER="${REMOVE_USER,,}"
-  if [[ "$REMOVE_USER" == "y" ]]; then
-    # userdel -r deletes the home directory and, on most distros, the
-    # associated subuid/subgid entries. Run the explicit removal first
-    # in case that behavior differs.
-    remove_subuid_subgid_range "${CF_USER}"
-    remove_user_account "${CF_USER}"
-  else
-    info "Keeping user account: ${CF_USER} (leaving subuid/subgid range intact for future rootless use)"
+  remove_user_state_if_requested "${CF_USER}" "${REMOVE_USER}"
+
+  REMOVE_DEV_USER="n"
+  if [[ "$REMOVE_DEV" == "y" ]]; then
+    if [[ "${DEV_USER}" == "${CF_USER}" ]]; then
+      info "Dev shares the same user as prod (${CF_USER}); already handled above."
+      REMOVE_DEV_USER="${REMOVE_USER}"
+    else
+      echo
+      read -r -p "Remove dev user account '${DEV_USER}' and home directory? [y/N]: " REMOVE_DEV_USER
+      REMOVE_DEV_USER="${REMOVE_DEV_USER,,}"
+      remove_user_state_if_requested "${DEV_USER}" "${REMOVE_DEV_USER}"
+    fi
   fi
 
   echo
@@ -473,18 +548,29 @@ main() {
   info "=========================================="
   echo
   info "Summary of what was processed:"
-  echo "  - cloudflared.service stopped, disabled, and Quadlet files removed"
-  echo "  - Container and image(s) removed"
+  echo "  - cloudflared.service (prod) stopped, disabled, and Quadlet files removed"
+  echo "  - Prod container and image(s) removed"
   echo "  - Linger disabled for ${CF_USER}"
+  if [[ "$REMOVE_DEV" == "y" ]]; then
+    echo "  - cloudflared-dev.service (dev) stopped, disabled, and Quadlet files removed"
+    echo "  - Dev container and image(s) removed"
+    if [[ "${DEV_USER}" != "${CF_USER}" ]]; then
+      echo "  - Linger disabled for ${DEV_USER}"
+    fi
+  fi
   echo "  - /etc/sysctl.d/99-cloudflared.conf removed"
   if [[ "$TWO_NIC_ROUTING" == "y" ]]; then
     echo "  - Policy routing reversed on ${ETH1_IFACE} (ip rule, origin table routes, rt_tables entry, persistence files, NetworkManager profile)"
   fi
   [[ "$REMOVE_JOURNAL" == "y" ]] && echo "  - Persistent journaling configuration removed"
   echo "  - /etc/profile.d/cloudflared-aliases.sh removed"
-  echo "  - /usr/local/sbin/cloudflared-container management command removed"
+  echo "  - /usr/local/sbin/cloudflared-container-prod management command removed"
+  [[ "$REMOVE_DEV" == "y" ]] && echo "  - /usr/local/sbin/cloudflared-container-dev management command removed"
   if [[ "$REMOVE_USER" == "y" ]]; then
-    echo "  - subuid/subgid range removed and user account '${CF_USER}' deleted"
+    echo "  - subuid/subgid range removed and prod user account '${CF_USER}' deleted"
+  fi
+  if [[ "$REMOVE_DEV" == "y" && "${DEV_USER}" != "${CF_USER}" && "$REMOVE_DEV_USER" == "y" ]]; then
+    echo "  - subuid/subgid range removed and dev user account '${DEV_USER}' deleted"
   fi
   echo
   info "Not removed (shared system state, left for you to review):"
