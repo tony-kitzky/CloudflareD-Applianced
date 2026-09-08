@@ -15,14 +15,17 @@
 #  3) Disable linger for the instance's user
 #  4) Remove /etc/sysctl.d/99-cloudflared.conf (ping_group_range, UDP buffers)
 #     -- shared by both instances, removed once
-#  5) OPTIONAL policy routing rollback (only if it was configured):
-#      - remove ip rule for traffic sourced from the eth1 IPv4 address
-#      - remove RFC1918 routes from route-table "origin" on eth1
+#  5) Policy routing cleanup -- ALWAYS runs and auto-detects whatever is
+#     present, regardless of which interface it's on or whether setup put
+#     it there. No prompt needed; every step is a no-op if nothing matches:
+#      - remove any ip rule that routes into table "origin"
+#      - remove any RFC1918 routes from route-table "origin"
 #      - remove the "origin" entry from /etc/iproute2/rt_tables
-#      - remove persistence files: /etc/sysconfig/network-scripts/route-eth1
-#        and rule-eth1
-#      - restore eth1's NetworkManager profile (re-enable default-route
-#        eligibility, i.e. undo ipv4.never-default yes / gateway removal)
+#      - remove any /etc/sysconfig/network-scripts/route-* or rule-*
+#        persistence file that references the origin table
+#      - restore any NetworkManager profile with ipv4.never-default yes
+#        (re-enable default-route eligibility; gateway is not restored
+#        since setup does not record the original value)
 #  6) Remove /etc/systemd/journald.conf.d/99-persistent.conf (persistent
 #     journaling) and restart journald if requested
 #  7) Remove /etc/profile.d/cloudflared-aliases.sh (contains both prod and
@@ -60,15 +63,7 @@ user_exists() { id "$1" >/dev/null 2>&1; }
 
 user_uid() { id -u "$1"; }
 
-iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
-
 is_systemctl_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
-
-get_nmcli_con_for_dev() {
-  local dev="$1"
-  command -v nmcli >/dev/null 2>&1 || return 0
-  nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: -v d="$dev" '$2==d {print $1; exit}'
-}
 
 # Run systemctl --user for a given user in non-interactive contexts.
 # Mirrors user_systemctl() in the setup script.
@@ -221,80 +216,95 @@ remove_sysctl_cloudflared() {
 }
 
 #------------------------------------------------------------------------------
-# 5) Reverse dual-NIC policy routing (only if it was configured)
+# 5) Remove any leftover dual-NIC policy routing, unconditionally.
+#
+# This does NOT depend on the setup script having created these -- it
+# actively detects and removes anything matching the "origin" policy
+# routing pattern (ip rules, routes, rt_tables entry, persistence files,
+# and NetworkManager never-default flags), regardless of which interface
+# they reference or whether the interface still exists. Safe to run even
+# if none of this is present; every removal step is a no-op when nothing
+# matches.
 #------------------------------------------------------------------------------
 remove_policy_routing_two_nic() {
-  local eth1_ip="$1"
-  local eth1_iface="${2:-eth1}"
   local rt_name="origin"
   local rt_id="100"
   local rt_tables_file="/etc/iproute2/rt_tables"
-  local rules_file="/etc/sysconfig/network-scripts/rule-eth1"
-  local routes_file="/etc/sysconfig/network-scripts/route-eth1"
+  local found_any=0
 
-  if ! iface_exists "$eth1_iface"; then
-    warn "Interface $eth1_iface not found; skipping policy routing rollback"
-    return 0
-  fi
+  info "Scanning for leftover policy routing (table '${rt_name}')"
 
-  info "Reversing policy routing configured on ${eth1_iface}"
+  # Remove every ip rule that references the origin table, regardless of
+  # source address or priority (handles rules left behind by any prior
+  # version of the setup script, or ones edited by hand).
+  local rule_line
+  while IFS= read -r rule_line; do
+    [[ -n "$rule_line" ]] || continue
+    found_any=1
+    info "Removing ip rule: ${rule_line}"
+    # shellcheck disable=SC2086
+    ip rule del ${rule_line} 2>/dev/null || warn "Failed to remove ip rule: ${rule_line}"
+  done < <(ip -4 rule show 2>/dev/null | grep -w "lookup ${rt_name}" | sed -E 's/^[0-9]+:[[:space:]]*//')
 
-  # Remove the ip rule that sends eth1-sourced traffic into the origin table.
-  if [[ -n "$eth1_ip" ]]; then
-    ip rule del from "${eth1_ip}/32" table "$rt_name" priority 100 2>/dev/null || \
-      warn "ip rule for ${eth1_ip}/32 -> table ${rt_name} not found (may already be removed)"
-  else
-    warn "No eth1 IPv4 address provided; skipping targeted ip rule removal (check 'ip rule show' manually)"
-  fi
-
-  # Remove RFC1918 routes from the origin table (mirrors the three
-  # ip route replace calls in configure_policy_routing_two_nic()).
-  ip route del 10.0.0.0/8 dev "$eth1_iface" table "$rt_name" 2>/dev/null || true
-  ip route del 172.16.0.0/12 dev "$eth1_iface" table "$rt_name" 2>/dev/null || true
-  ip route del 192.168.0.0/16 dev "$eth1_iface" table "$rt_name" 2>/dev/null || true
+  # Remove every route in the origin table, on whatever interface(s) it
+  # was created for (not hardcoded to eth1).
+  local route_line
+  while IFS= read -r route_line; do
+    [[ -n "$route_line" ]] || continue
+    found_any=1
+    info "Removing route from table ${rt_name}: ${route_line}"
+    # shellcheck disable=SC2086
+    ip route del ${route_line} table "$rt_name" 2>/dev/null || \
+      warn "Failed to remove route from table ${rt_name}: ${route_line}"
+  done < <(ip -4 route show table "$rt_name" 2>/dev/null)
 
   # Remove the named route table entry from rt_tables.
   if [[ -f "$rt_tables_file" ]] && grep -Eq "^[[:space:]]*${rt_id}[[:space:]]+${rt_name}([[:space:]]|$)" "$rt_tables_file"; then
+    found_any=1
     info "Removing '${rt_id} ${rt_name}' entry from ${rt_tables_file}"
     sed -i.bak -E "/^[[:space:]]*${rt_id}[[:space:]]+${rt_name}([[:space:]]|$)/d" "$rt_tables_file"
     rm -f "${rt_tables_file}.bak"
-  else
-    warn "'${rt_id} ${rt_name}' entry not found in ${rt_tables_file} (may already be removed)"
   fi
 
-  # Remove persistence files written by setup.
-  if [[ -f "$routes_file" ]]; then
-    info "Removing route persistence file: $routes_file"
-    rm -f "$routes_file"
-  else
-    warn "Route persistence file not found: $routes_file"
+  # Remove persistence files for every interface, not just eth1 -- match
+  # anything named rule-* / route-* under the network-scripts persistence
+  # directory whose content references the origin table.
+  local scripts_dir="/etc/sysconfig/network-scripts"
+  if [[ -d "$scripts_dir" ]]; then
+    local f
+    for f in "${scripts_dir}"/rule-* "${scripts_dir}"/route-*; do
+      [[ -f "$f" ]] || continue
+      if grep -q "$rt_name" "$f" 2>/dev/null; then
+        found_any=1
+        info "Removing persistence file: $f"
+        rm -f "$f"
+      fi
+    done
   fi
 
-  if [[ -f "$rules_file" ]]; then
-    info "Removing rule persistence file: $rules_file"
-    rm -f "$rules_file"
-  else
-    warn "Rule persistence file not found: $rules_file"
-  fi
-
-  # Restore eth1's NetworkManager profile: undo ipv4.never-default yes and
-  # the removed ipv4.gateway that configure_policy_routing_two_nic() applied.
+  # Restore any NetworkManager profile that has ipv4.never-default set,
+  # regardless of which interface it's attached to.
   if command -v nmcli >/dev/null 2>&1; then
-    local con1
-    con1="$(get_nmcli_con_for_dev "$eth1_iface" || true)"
-    if [[ -n "$con1" ]]; then
-      info "Restoring NetworkManager default-route eligibility for ${eth1_iface}: ${con1}"
-      nmcli con mod "$con1" ipv4.never-default no >/dev/null 2>&1 || \
-        warn "Failed to reset ipv4.never-default on ${con1}"
-      info "Note: eth1's gateway was removed by setup and its original value was not recorded;"
-      info "      set it manually if eth1 needs a gateway again: nmcli con mod ${con1} ipv4.gateway <ip>"
-      nmcli con up "$con1" >/dev/null 2>&1 || warn "Failed to bring up connection: $con1"
-    else
-      warn "No active NetworkManager connection found for ${eth1_iface}; skipping profile restore"
-    fi
+    local con
+    while IFS= read -r con; do
+      [[ -n "$con" ]] || continue
+      found_any=1
+      info "Restoring default-route eligibility on NetworkManager connection: ${con}"
+      nmcli con mod "$con" ipv4.never-default no >/dev/null 2>&1 || \
+        warn "Failed to reset ipv4.never-default on ${con}"
+      info "Note: the original gateway for '${con}' was not recorded by setup;"
+      info "      set it manually if needed: nmcli con mod ${con} ipv4.gateway <ip>"
+      nmcli con up "$con" >/dev/null 2>&1 || warn "Failed to bring up connection: $con (may not be active right now)"
+    done < <(nmcli -t -f NAME,ipv4.never-default con show 2>/dev/null | awk -F: '$2=="yes" {print $1}')
   fi
 
-  info "Policy routing rollback sanity check:"
+  if [[ "$found_any" -eq 1 ]]; then
+    info "Policy routing rollback complete."
+  else
+    info "No leftover policy routing found; nothing to remove."
+  fi
+
+  info "Sanity check:"
   ip rule show | sed 's/^/  /'
   ip route show table "$rt_name" 2>/dev/null | sed 's/^/  /' || echo "  (table ${rt_name} is now empty or removed)"
 }
@@ -452,27 +462,6 @@ main() {
   fi
 
   echo
-  read -r -p "Was dual-NIC origin policy routing configured on this host? [y/N]: " TWO_NIC_ROUTING
-  TWO_NIC_ROUTING="${TWO_NIC_ROUTING,,}"
-
-  ETH1_IFACE="eth1"
-  ETH1_IP=""
-  if [[ "$TWO_NIC_ROUTING" == "y" ]]; then
-    read -r -p "Enter the secondary interface name [eth1]: " ETH1_IFACE
-    ETH1_IFACE="${ETH1_IFACE:-eth1}"
-
-    if iface_exists "$ETH1_IFACE"; then
-      ETH1_IP="$(ip -4 -o addr show dev "$ETH1_IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
-    fi
-
-    if [[ -z "$ETH1_IP" ]]; then
-      read -r -p "Could not auto-detect ${ETH1_IFACE}'s IPv4 address. Enter it manually (or leave blank to skip the ip-rule removal step): " ETH1_IP
-    else
-      info "Detected ${ETH1_IFACE} IPv4 address: ${ETH1_IP}"
-    fi
-  fi
-
-  echo
   echo "Starting uninstall..."
   echo
 
@@ -496,13 +485,11 @@ main() {
   # 4. Remove sysctl config (shared, once)
   remove_sysctl_cloudflared
 
-  # 5. Reverse policy routing, only if it was configured
-  if [[ "$TWO_NIC_ROUTING" == "y" ]]; then
-    echo
-    remove_policy_routing_two_nic "${ETH1_IP}" "${ETH1_IFACE}"
-  else
-    info "Skipping policy routing rollback (not configured on this host)"
-  fi
+  # 5. Remove any leftover policy routing -- always runs, auto-detects
+  # whatever is present rather than relying on the user to know if/where
+  # it was configured.
+  echo
+  remove_policy_routing_two_nic
 
   # 6. Remove persistent journaling config
   echo
@@ -559,9 +546,7 @@ main() {
     fi
   fi
   echo "  - /etc/sysctl.d/99-cloudflared.conf removed"
-  if [[ "$TWO_NIC_ROUTING" == "y" ]]; then
-    echo "  - Policy routing reversed on ${ETH1_IFACE} (ip rule, origin table routes, rt_tables entry, persistence files, NetworkManager profile)"
-  fi
+  echo "  - Any leftover policy routing removed (ip rules, origin table routes, rt_tables entry, persistence files, NetworkManager profile -- auto-detected)"
   [[ "$REMOVE_JOURNAL" == "y" ]] && echo "  - Persistent journaling configuration removed"
   echo "  - /etc/profile.d/cloudflared-aliases.sh removed"
   echo "  - /usr/local/sbin/cloudflared-container-prod management command removed"
@@ -576,10 +561,8 @@ main() {
   info "Not removed (shared system state, left for you to review):"
   echo "  - Packages: podman, passt -- remove manually if unused elsewhere:"
   echo "      sudo dnf remove podman passt"
-  if [[ "$TWO_NIC_ROUTING" == "y" ]]; then
-    echo "  - eth1's original NetworkManager gateway value (removed by setup, not recorded) -- set manually if needed:"
-    echo "      nmcli con mod <connection> ipv4.gateway <ip>"
-  fi
+  echo "  - Any policy-routed interface's original NetworkManager gateway value (not recorded) -- set manually if needed:"
+  echo "      nmcli con mod <connection> ipv4.gateway <ip>"
   echo
   info "Verify final state:"
   echo "  ip rule show"
