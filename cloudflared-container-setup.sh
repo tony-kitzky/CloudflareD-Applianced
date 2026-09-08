@@ -17,6 +17,12 @@
 #     always runs as "<base>-dev" (a distinct account from prod):
 #      a) cloudflared image tag
 #      b) cloudflared tunnel token
+# 3b) Prompt once (shared by both prod and dev) for the network interface
+#     to bind outgoing Cloudflare Edge connections to. The interface's
+#     IPv4 address is written as TUNNEL_EDGE_BIND_ADDRESS; TUNNEL_EDGE_IP_VERSION
+#     is always hardcoded to "4" (no prompt). Both env vars are written
+#     into each instance's 40-image[-dev].conf drop-in, using the same
+#     values for prod and dev.
 #  4) Enable persistent journaling + per-user journals
 #  5) Enable boot-start for user services (linger) for each instance's user
 #  6) Write /etc/sysctl.d/99-cloudflared.conf to update system limits for ping users and udp socket buffers
@@ -39,6 +45,10 @@
 #    sets XDG_RUNTIME_DIR to avoid "Failed to connect to bus: No medium found".
 #  - The "prod" and "dev" instances always run under distinct rootless
 #    users, "<base>-prod" and "<base>-dev", derived from one base username.
+#  - TUNNEL_EDGE_IP_VERSION/TUNNEL_EDGE_BIND_ADDRESS are set once from a
+#    single interface selection and shared by both instances; the
+#    management command's upgrade action preserves them across image
+#    tag changes instead of resetting the drop-in file.
 #
 # Usage:
 #   sudo bash cloudflared-container-setup.sh
@@ -48,10 +58,19 @@ set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "INFO: $*" >&2; }
+warn() { echo "WARN: $*" >&2; }
 
 require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0"; }
 
 iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
+
+# Print the first IPv4 address (no CIDR suffix) assigned to the given
+# interface, or return non-zero if none is found.
+iface_ipv4_address() {
+  local iface="$1"
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
+    | awk '{print $4}' | cut -d/ -f1 | head -n1
+}
 
 user_exists() { id "$1" >/dev/null 2>&1; }
 
@@ -402,12 +421,23 @@ action_upgrade() {
   info "Pulling new image as user ${CF_USER}: ${new_image}"
   user_run "$CF_USER" "podman pull '${new_image}'" || die "Failed to pull image: ${new_image}"
 
+  # Preserve the existing TUNNEL_EDGE_IP_VERSION / TUNNEL_EDGE_BIND_ADDRESS
+  # settings rather than dropping them on upgrade.
+  local current_edge_ip_version current_edge_bind_address
+  current_edge_ip_version="$(grep -E '^Environment=TUNNEL_EDGE_IP_VERSION=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_IP_VERSION=##')"
+  current_edge_bind_address="$(grep -E '^Environment=TUNNEL_EDGE_BIND_ADDRESS=' "$IMAGE_DROPIN" 2>/dev/null | sed -E 's#^Environment=TUNNEL_EDGE_BIND_ADDRESS=##')"
+  current_edge_ip_version="${current_edge_ip_version:-4}"
+
   info "Updating image drop-in: ${IMAGE_DROPIN}"
-  cat >"${IMAGE_DROPIN}" <<EOF
-[Container]
-Image=${new_image}
-Pull=never
-EOF
+  {
+    echo "[Container]"
+    echo "Image=${new_image}"
+    echo "Pull=never"
+    echo "Environment=TUNNEL_EDGE_IP_VERSION=${current_edge_ip_version}"
+    if [[ -n "$current_edge_bind_address" ]]; then
+      echo "Environment=TUNNEL_EDGE_BIND_ADDRESS=${current_edge_bind_address}"
+    fi
+  } >"${IMAGE_DROPIN}"
   chown "${CF_USER}:${CF_USER}" "${IMAGE_DROPIN}"
   chmod 0600 "${IMAGE_DROPIN}"
 
@@ -543,8 +573,12 @@ MANAGE_SCRIPT_EOF
 #     - prod uses unit basename "cloudflared" (unit: cloudflared.service)
 #     - dev uses unit basename "cloudflared-dev" (unit: cloudflared-dev.service)
 #       and all drop-in filenames are suffixed "-dev"
+#   edge_bind_address: IPv4 address written to TUNNEL_EDGE_BIND_ADDRESS in
+#     the image drop-in, alongside a hardcoded TUNNEL_EDGE_IP_VERSION=4.
+#     Same value used for both prod and dev (derived once from the
+#     interface the user selects in main()).
 create_quadlet_rootless() {
-  local instance="$1" u="$2" tag="$3" token="$4"
+  local instance="$1" u="$2" tag="$3" token="$4" edge_bind_address="$5"
   local homedir quadlet_dir unit_base container_name container_file dropin_dir
   local image_dropin icmp_dropin token_dropin env_file suffix
 
@@ -598,6 +632,8 @@ EOF
 [Container]
 Image=docker.io/cloudflare/cloudflared:${tag}
 Pull=never
+Environment=TUNNEL_EDGE_IP_VERSION=4
+Environment=TUNNEL_EDGE_BIND_ADDRESS=${edge_bind_address}
 EOF
   chown "$u:$u" "$image_dropin"
   chmod 0600 "$image_dropin"
@@ -669,6 +705,25 @@ main() {
   CF_USER="${BASE_USER}-prod"
 
   #-----------------------------------------------------------------------
+  # Cloudflare Edge bind address -- same value used for both prod and dev.
+  # TUNNEL_EDGE_IP_VERSION is always "4"; no prompt needed for it.
+  #-----------------------------------------------------------------------
+  echo
+  local edge_iface=""
+  while true; do
+    read -r -p "Enter the network interface to bind outgoing Cloudflare Edge connections to [eth0]: " edge_iface
+    edge_iface="${edge_iface:-eth0}"
+    if iface_exists "${edge_iface}"; then
+      break
+    fi
+    warn "Interface not found: ${edge_iface}"
+  done
+
+  EDGE_BIND_ADDRESS="$(iface_ipv4_address "${edge_iface}")"
+  [[ -n "${EDGE_BIND_ADDRESS}" ]] || die "Could not determine an IPv4 address for interface: ${edge_iface}"
+  info "Using TUNNEL_EDGE_BIND_ADDRESS=${EDGE_BIND_ADDRESS} (from interface ${edge_iface}), TUNNEL_EDGE_IP_VERSION=4"
+
+  #-----------------------------------------------------------------------
   # "prod" instance (always installed)
   #-----------------------------------------------------------------------
   echo
@@ -688,7 +743,7 @@ main() {
 
   enable_linger_for_user "${CF_USER}"
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
-  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}"
+  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}" "${EDGE_BIND_ADDRESS}"
 
   #-----------------------------------------------------------------------
   # "dev" instance (optional) -- always runs as "${BASE_USER}-dev"
@@ -712,7 +767,7 @@ main() {
 
     enable_linger_for_user "${DEV_USER}"
     pull_cloudflared_image_rootless "${DEV_USER}" "${DEV_TAG}"
-    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}"
+    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}" "${EDGE_BIND_ADDRESS}"
   else
     info "Skipping dev container installation."
   fi
