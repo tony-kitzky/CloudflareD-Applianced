@@ -362,9 +362,9 @@ action_status() {
     warn "Could not inspect '${CONTAINER_NAME}' container (it may not be running)"
 
   echo
-  info "== systemctl --user status ${UNIT_BASE}.container (as user: ${CF_USER}) =="
-  user_systemctl "$CF_USER" status "${UNIT_BASE}.container" -l --no-pager || \
-    warn "Could not read systemctl --user status for ${UNIT_BASE}.container"
+  info "== systemctl --user status ${UNIT_BASE}.service (as user: ${CF_USER}) =="
+  user_systemctl "$CF_USER" status "${UNIT_BASE}.service" -l --no-pager || \
+    warn "Could not read systemctl --user status for ${UNIT_BASE}.service"
 
   echo
   info "== Recent journal (last 30 lines) =="
