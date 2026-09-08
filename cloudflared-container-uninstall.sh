@@ -5,10 +5,11 @@
 # Alma Linux 9 server running rootless cloudflared via Podman Quadlet.
 #
 # This script mirrors cloudflared-container-setup.sh step for step and
-# reverses only what that script actually does. The "prod" instance is
-# always processed; the "dev" instance (cloudflared-dev.service and its
-# -dev-suffixed Quadlet/drop-in files) is processed too if you confirm it
-# was installed:
+# reverses only what that script actually does. You are prompted once for
+# the base username; the "prod" instance (user "<base>-prod") is always
+# processed, and the "dev" instance (user "<base>-dev", cloudflared-dev.service
+# and its -dev-suffixed Quadlet/drop-in files) is processed too if you
+# confirm it was installed:
 #  1) Stop, disable, and remove the cloudflared[-dev].service + Quadlet
 #     files (base container unit, image/icmp/token drop-ins, token env file)
 #  2) Remove the cloudflared[-dev] container and pulled image(s)
@@ -30,8 +31,9 @@
 #     journaling) and restart journald if requested
 #  7) Remove /etc/profile.d/cloudflared-aliases.sh (contains both prod and
 #     dev aliases, if dev was installed; removed once)
-#  8) Remove /usr/local/sbin/cloudflared-container-prod and, if dev was
-#     installed, /usr/local/sbin/cloudflared-container-dev
+#  8) Remove the single merged /usr/local/sbin/cloudflared-container
+#     management command (also cleans up legacy per-instance
+#     -prod/-dev named commands left by older setup script versions)
 #  9) Remove subuid/subgid ranges this setup allocated (only the range the
 #     setup script adds: 100000-165535), IF each instance's user account is
 #     not being kept for other purposes. If prod and dev share the same
@@ -347,12 +349,13 @@ remove_cloudflared_aliases() {
 }
 
 #------------------------------------------------------------------------------
-# 8) Remove the /usr/local/sbin/cloudflared-container-<instance> management
-#    command installed by cloudflared-container-setup.sh
+# 8) Remove the single merged /usr/local/sbin/cloudflared-container
+#    management command installed by cloudflared-container-setup.sh
+#    (also removes older-style per-instance -prod/-dev named commands
+#    left behind by earlier versions of the setup script, if present)
 #------------------------------------------------------------------------------
 remove_management_command() {
-  local instance="$1"
-  local install_path="/usr/local/sbin/cloudflared-container-${instance}"
+  local install_path="/usr/local/sbin/cloudflared-container"
 
   if [[ -f "$install_path" ]]; then
     info "Removing management command: $install_path"
@@ -360,6 +363,14 @@ remove_management_command() {
   else
     warn "Management command not found: $install_path (may already be removed)"
   fi
+
+  local legacy_path
+  for legacy_path in /usr/local/sbin/cloudflared-container-prod /usr/local/sbin/cloudflared-container-dev; do
+    if [[ -f "$legacy_path" ]]; then
+      info "Removing legacy management command: $legacy_path"
+      rm -f "$legacy_path"
+    fi
+  done
 }
 
 #------------------------------------------------------------------------------
@@ -428,11 +439,17 @@ main() {
   echo
 
   #-----------------------------------------------------------------------
+  # Base username -- prod and dev always run as "<base>-prod" and
+  # "<base>-dev", matching cloudflared-container-setup.sh.
+  #-----------------------------------------------------------------------
+  read -r -p "Enter the base username used for cloudflared [cloudflared]: " BASE_USER
+  BASE_USER="${BASE_USER:-cloudflared}"
+
+  #-----------------------------------------------------------------------
   # "prod" instance (always processed)
   #-----------------------------------------------------------------------
   info "Configuring removal of the 'prod' cloudflared container"
-  read -r -p "Enter the username that runs prod cloudflared [cloudflared]: " CF_USER
-  CF_USER="${CF_USER:-cloudflared}"
+  CF_USER="${BASE_USER}-prod"
 
   if ! user_exists "${CF_USER}"; then
     warn "User ${CF_USER} does not exist. Steps tied to that user will be skipped."
@@ -451,8 +468,7 @@ main() {
   DEV_TAG=""
   if [[ "$REMOVE_DEV" == "y" ]]; then
     info "Configuring removal of the 'dev' cloudflared container"
-    read -r -p "Enter the username that runs dev cloudflared [${CF_USER}]: " DEV_USER
-    DEV_USER="${DEV_USER:-$CF_USER}"
+    DEV_USER="${BASE_USER}-dev"
 
     if ! user_exists "${DEV_USER}"; then
       warn "User ${DEV_USER} does not exist. Steps tied to that user will be skipped."
@@ -504,11 +520,8 @@ main() {
   # 7. Remove shell aliases (single shared file covers both instances)
   remove_cloudflared_aliases
 
-  # 8. Remove the cloudflared-container-<instance> management command(s)
-  remove_management_command "prod"
-  if [[ "$REMOVE_DEV" == "y" ]]; then
-    remove_management_command "dev"
-  fi
+  # 8. Remove the single merged cloudflared-container management command
+  remove_management_command
 
   # 9/10. subuid/subgid + optional user removal
   echo
@@ -549,8 +562,7 @@ main() {
   echo "  - Any leftover policy routing removed (ip rules, origin table routes, rt_tables entry, persistence files, NetworkManager profile -- auto-detected)"
   [[ "$REMOVE_JOURNAL" == "y" ]] && echo "  - Persistent journaling configuration removed"
   echo "  - /etc/profile.d/cloudflared-aliases.sh removed"
-  echo "  - /usr/local/sbin/cloudflared-container-prod management command removed"
-  [[ "$REMOVE_DEV" == "y" ]] && echo "  - /usr/local/sbin/cloudflared-container-dev management command removed"
+  echo "  - /usr/local/sbin/cloudflared-container management command removed"
   if [[ "$REMOVE_USER" == "y" ]]; then
     echo "  - subuid/subgid range removed and prod user account '${CF_USER}' deleted"
   fi
