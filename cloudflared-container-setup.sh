@@ -96,113 +96,84 @@ nm_connection_for_iface() {
     | awk -F: -v d="$iface" '$1==d {print $2; exit}'
 }
 
-# Print the currently-configured ipv4.route-metric for a NetworkManager
-# connection, or nothing if it is unset (NetworkManager then applies an
-# interface-type default, e.g. 100 for Ethernet).
-nm_route_metric_for_connection() {
-  local conn="$1"
-  nmcli -t -g ipv4.route-metric connection show "$conn" 2>/dev/null
-}
+# Static IPv4 CIDR ranges covering Cloudflare's documented Tunnel edge
+# addresses (region1.v2.argotunnel.com / region2.v2.argotunnel.com,
+# TCP/UDP port 7844), for the default (non-US, non-FedRAMP) region. See:
+# https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/
+readonly CLOUDFLARE_TUNNEL_EDGE_PREFIXES=("198.41.192.0/24" "198.41.200.0/24")
 
-# Ensure the private RFC 1918 ranges keep routing out the "primary"
-# interface (normally eth0) via its existing gateway, and that the edge
-# interface (e.g. eth1) wins the default route by metric. Without the
-# three explicit routes below, lowering the edge interface's metric
-# would send RFC 1918 traffic out the edge interface too, which is not
-# what we want -- only unmatched (default-route) traffic, i.e. the path
-# to Cloudflare Edge, should prefer the edge interface.
+# Route only Cloudflare's Tunnel edge ranges out the edge interface (e.g.
+# eth1), via that interface's own gateway. The default route and every
+# other destination -- including RFC 1918 ranges and general internet
+# egress (package repos, container registries, etc.) -- are left
+# completely untouched on the primary interface (normally eth0).
+#
+# This is intentionally narrow: it does NOT touch the default route or
+# its metric on either interface. Only these two specific /24s are
+# added as static routes via the edge interface's gateway.
 #
 # Applied via NetworkManager (nmcli) so the change survives reboots.
-# Uses "nmcli device reapply" rather than "connection up" so the changes
-# take effect without a full connection bounce -- important since the
-# primary interface is normally also the one carrying the admin's SSH
-# session.
+# Uses "nmcli device reapply" rather than "connection up" so the change
+# takes effect without a full connection bounce.
 configure_edge_routing() {
   local edge_iface="$1"
 
   command -v nmcli >/dev/null 2>&1 || {
-    warn "nmcli not found; skipping RFC 1918 static routes / route metric setup for ${edge_iface}."
+    warn "nmcli not found; skipping Cloudflare Tunnel edge static routes for ${edge_iface}."
     return 0
   }
 
   local primary_iface
   primary_iface="$(default_route_iface)"
   if [[ -z "$primary_iface" ]]; then
-    warn "Could not determine the interface currently holding the default route; skipping RFC 1918 static routes / route metric setup."
+    warn "Could not determine the interface currently holding the default route; skipping Cloudflare Tunnel edge static routes."
     return 0
   fi
   if [[ "$primary_iface" == "$edge_iface" ]]; then
-    info "Default route is already on ${edge_iface}; no separate primary interface to route RFC 1918 traffic through, skipping."
+    info "${edge_iface} already holds the default route; no separate routing needed for Cloudflare Tunnel edge ranges, skipping."
     return 0
   fi
 
-  local primary_gateway
-  primary_gateway="$(default_route_gateway_on_iface "$primary_iface")"
-  if [[ -z "$primary_gateway" ]]; then
-    warn "Could not determine the default gateway on ${primary_iface}; skipping RFC 1918 static routes / route metric setup."
+  local edge_gateway
+  edge_gateway="$(default_route_gateway_on_iface "$edge_iface")"
+  if [[ -z "$edge_gateway" ]]; then
+    warn "Could not determine a gateway on ${edge_iface} (no default route present on it); skipping Cloudflare Tunnel edge static routes. You may need to add these routes manually: ${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[*]}"
     return 0
   fi
 
-  local primary_conn edge_conn
-  primary_conn="$(nm_connection_for_iface "$primary_iface")"
+  local edge_conn
   edge_conn="$(nm_connection_for_iface "$edge_iface")"
-  if [[ -z "$primary_conn" || -z "$edge_conn" ]]; then
-    warn "Could not resolve NetworkManager connections for ${primary_iface}/${edge_iface}; skipping RFC 1918 static routes / route metric setup."
+  if [[ -z "$edge_conn" ]]; then
+    warn "Could not resolve a NetworkManager connection for ${edge_iface}; skipping Cloudflare Tunnel edge static routes."
     return 0
   fi
-
-  local primary_metric edge_metric
-  primary_metric="$(nm_route_metric_for_connection "$primary_conn")"
-  primary_metric="${primary_metric:-100}"
-  edge_metric=$(( primary_metric > 50 ? primary_metric - 50 : 1 ))
-
-  local rfc1918_prefixes=("10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16")
 
   echo
-  info "Planned network changes so this host uses ${edge_iface} to reach Cloudflare Edge and ${primary_iface} for RFC 1918 destinations:"
-  info "  - Add static routes via ${primary_gateway} on '${primary_conn}' (${primary_iface}) for: ${rfc1918_prefixes[*]}"
-  info "  - Set route metric on '${edge_conn}' (${edge_iface}) to ${edge_metric} (lower/preferred vs. ${primary_iface}'s ${primary_metric})"
-  read -r -p "Apply these network changes now? [y/N]: " confirm_routing
+  info "Planned network change so this host reaches Cloudflare Tunnel edge servers via ${edge_iface}, while everything else (including the public internet and RFC 1918 destinations) keeps using ${primary_iface} unchanged:"
+  info "  - Add static routes via ${edge_gateway} on '${edge_conn}' (${edge_iface}) for: ${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[*]}"
+  read -r -p "Apply this network change now? [y/N]: " confirm_routing
   if [[ "${confirm_routing,,}" != "y" ]]; then
-    warn "Skipping RFC 1918 static routes / route metric setup at your request."
+    warn "Skipping Cloudflare Tunnel edge static routes at your request."
     return 0
   fi
 
   local existing_routes prefix route_changed=0
-  existing_routes="$(nmcli -t -g ipv4.routes connection show "$primary_conn" 2>/dev/null)"
-  for prefix in "${rfc1918_prefixes[@]}"; do
+  existing_routes="$(nmcli -t -g ipv4.routes connection show "$edge_conn" 2>/dev/null)"
+  for prefix in "${CLOUDFLARE_TUNNEL_EDGE_PREFIXES[@]}"; do
     if [[ "$existing_routes" == *"${prefix}"* ]]; then
-      info "Route for ${prefix} already present on '${primary_conn}', leaving as-is."
+      info "Route for ${prefix} already present on '${edge_conn}', leaving as-is."
       continue
     fi
-    info "Adding route ${prefix} via ${primary_gateway} to '${primary_conn}'"
-    nmcli connection modify "$primary_conn" +ipv4.routes "${prefix} ${primary_gateway}" \
-      || { warn "Failed to add route ${prefix} to '${primary_conn}'"; continue; }
+    info "Adding route ${prefix} via ${edge_gateway} to '${edge_conn}'"
+    nmcli connection modify "$edge_conn" +ipv4.routes "${prefix} ${edge_gateway}" \
+      || { warn "Failed to add route ${prefix} to '${edge_conn}'"; continue; }
     route_changed=1
   done
 
   if [[ "$route_changed" == "1" ]]; then
-    nmcli device reapply "$primary_iface" \
-      || warn "Failed to reapply '${primary_conn}' on ${primary_iface}; routes are saved but may need 'nmcli connection up ${primary_conn}' (or a reboot) to take effect."
+    nmcli device reapply "$edge_iface" \
+      || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; routes are saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
   fi
-
-  if [[ "$primary_metric" == "$edge_metric" ]]; then
-    warn "Computed edge metric (${edge_metric}) equals ${primary_iface}'s metric; leaving '${edge_conn}' metric unchanged to avoid an ambiguous default route."
-    return 0
-  fi
-
-  local current_edge_metric
-  current_edge_metric="$(nm_route_metric_for_connection "$edge_conn")"
-  if [[ "$current_edge_metric" == "$edge_metric" ]]; then
-    info "Route metric on '${edge_conn}' already ${edge_metric}, leaving as-is."
-    return 0
-  fi
-
-  info "Setting route metric ${edge_metric} on '${edge_conn}' (${edge_iface})"
-  nmcli connection modify "$edge_conn" ipv4.route-metric "$edge_metric" \
-    || { warn "Failed to set route metric on '${edge_conn}'"; return 0; }
-  nmcli device reapply "$edge_iface" \
-    || warn "Failed to reapply '${edge_conn}' on ${edge_iface}; metric is saved but may need 'nmcli connection up ${edge_conn}' (or a reboot) to take effect."
 
   echo
   info "Resulting IPv4 routing table:"
