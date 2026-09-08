@@ -229,6 +229,24 @@ user_uid() { id -u "$1"; }
 
 user_home() { getent passwd "$1" | awk -F: '{print $6}'; }
 
+iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
+
+# Print the first IPv4 address (no CIDR suffix) assigned to the given
+# interface, or return non-zero if none is found.
+iface_ipv4_address() {
+  local iface="$1"
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
+    | awk '{print $4}' | cut -d/ -f1 | head -n1
+}
+
+# Print the interface that currently owns the given IPv4 address, or
+# nothing if no interface has it.
+iface_for_ipv4_address() {
+  local addr="$1"
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk -v a="$addr" '{split($4,parts,"/"); if (parts[1]==a) {print $2; exit}}'
+}
+
 # Run systemctl --user for a given user, setting XDG_RUNTIME_DIR so that
 # any sudo-privileged caller (not just the instance user itself) can
 # reach that user's systemd --user session and manage the container.
@@ -326,6 +344,7 @@ resolve_instance() {
   DROPIN_DIR="${QUADLET_DIR}/${UNIT_BASE}.container.d"
   IMAGE_DROPIN="${DROPIN_DIR}/${IMAGE_DROPIN_NAME}"
   TOKEN_ENV_FILE="${DROPIN_DIR}/${TOKEN_ENV_NAME}"
+  CONTAINER_FILE="${QUADLET_DIR}/${UNIT_BASE}.container"
 
   [[ -d "$QUADLET_DIR" ]] || die "Quadlet directory not found for ${CF_USER}: ${QUADLET_DIR}"
 }
@@ -397,6 +416,54 @@ action_start() {
   user_systemctl "$CF_USER" status "${UNIT_BASE}.service" -l --no-pager || true
 }
 
+# Ensure the Quadlet .container unit has a "Network=pasta:-i,<iface>" line
+# telling pasta which host interface to copy addresses/routes from.
+# Older installs (created before this fix) have no Network= line at all,
+# which leaves pasta defaulting to the host's main/default-route
+# interface -- if TUNNEL_EDGE_BIND_ADDRESS is set to a *different*
+# interface's address, cloudflared fails with:
+#   bind: cannot assign requested address
+# Called from action_upgrade so existing deployments get the fix without
+# a full reinstall. Safe to call even when no bind address is set.
+repair_pasta_network_line() {
+  local bind_address="$1"
+  [[ -f "$CONTAINER_FILE" ]] || { warn "Container unit not found, skipping network fix: ${CONTAINER_FILE}"; return 0; }
+
+  local existing_network_line
+  existing_network_line="$(grep -E '^Network=pasta:' "$CONTAINER_FILE" 2>/dev/null || true)"
+
+  local iface=""
+  if [[ -n "$bind_address" ]]; then
+    iface="$(iface_for_ipv4_address "$bind_address")"
+  fi
+
+  if [[ -z "$iface" ]]; then
+    if [[ -n "$existing_network_line" ]]; then
+      info "Existing Network= line found (${existing_network_line}); leaving it as-is."
+      return 0
+    fi
+    if [[ -n "$bind_address" ]]; then
+      warn "Could not determine which interface currently owns ${bind_address}."
+    fi
+    read -r -p "Enter the network interface cloudflared should bind Edge connections to [skip]: " iface
+    [[ -n "$iface" ]] || { warn "No interface given; not adding a Network= line."; return 0; }
+    iface_exists "$iface" || die "Interface not found: ${iface}"
+  fi
+
+  local desired_network_line="Network=pasta:-i,${iface}"
+  if [[ "$existing_network_line" == "$desired_network_line" ]]; then
+    info "Network= line already correct (${desired_network_line})."
+    return 0
+  fi
+
+  info "Setting ${desired_network_line} in ${CONTAINER_FILE}"
+  if [[ -n "$existing_network_line" ]]; then
+    sed -i -E "s#^Network=pasta:.*#${desired_network_line}#" "$CONTAINER_FILE"
+  else
+    sed -i "/^Exec=/a ${desired_network_line}" "$CONTAINER_FILE"
+  fi
+}
+
 #------------------------------------------------------------------------------
 # 5) Upgrade the cloudflared container
 #------------------------------------------------------------------------------
@@ -440,6 +507,8 @@ action_upgrade() {
   } >"${IMAGE_DROPIN}"
   chown "${CF_USER}:${CF_USER}" "${IMAGE_DROPIN}"
   chmod 0600 "${IMAGE_DROPIN}"
+
+  repair_pasta_network_line "${current_edge_bind_address}"
 
   info "Reloading systemd --user daemon for user: ${CF_USER}"
   user_systemctl "$CF_USER" daemon-reload || die "Failed to reload user daemon"
@@ -510,7 +579,7 @@ print_menu() {
   echo "  2) Restart container"
   echo "  3) Stop container"
   echo "  4) Start container"
-  echo "  5) Upgrade container (change image tag)"
+  echo "  5) Upgrade container (change image tag, repair pasta network line)"
   echo "  6) Change tunnel token"
   echo "  7) Reload systemd --user daemon"
   echo "  8) Switch base username / prod-dev instance"
@@ -577,8 +646,15 @@ MANAGE_SCRIPT_EOF
 #     the image drop-in, alongside a hardcoded TUNNEL_EDGE_IP_VERSION=4.
 #     Same value used for both prod and dev (derived once from the
 #     interface the user selects in main()).
+#   edge_iface: the same interface edge_bind_address was derived from.
+#     Passed to pasta as "-i <iface>" (Network=pasta:-i,<iface> in the
+#     unit) so pasta copies that interface's address/routes into the
+#     container namespace -- otherwise pasta only copies the host's
+#     main/default-route interface, and binding to a non-default
+#     interface's address from inside the container fails with
+#     "bind: cannot assign requested address".
 create_quadlet_rootless() {
-  local instance="$1" u="$2" tag="$3" token="$4" edge_bind_address="$5"
+  local instance="$1" u="$2" tag="$3" token="$4" edge_bind_address="$5" edge_iface="$6"
   local homedir quadlet_dir unit_base container_name container_file dropin_dir
   local image_dropin icmp_dropin token_dropin env_file suffix
 
@@ -617,6 +693,7 @@ After=network-online.target
 [Container]
 ContainerName=${container_name}
 Exec=tunnel --no-autoupdate run
+Network=pasta:-i,${edge_iface}
 
 [Service]
 Restart=always
@@ -743,7 +820,7 @@ main() {
 
   enable_linger_for_user "${CF_USER}"
   pull_cloudflared_image_rootless "${CF_USER}" "${CF_TAG}"
-  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}" "${EDGE_BIND_ADDRESS}"
+  create_quadlet_rootless "prod" "${CF_USER}" "${CF_TAG}" "${CF_TOKEN}" "${EDGE_BIND_ADDRESS}" "${edge_iface}"
 
   #-----------------------------------------------------------------------
   # "dev" instance (optional) -- always runs as "${BASE_USER}-dev"
@@ -767,7 +844,7 @@ main() {
 
     enable_linger_for_user "${DEV_USER}"
     pull_cloudflared_image_rootless "${DEV_USER}" "${DEV_TAG}"
-    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}" "${EDGE_BIND_ADDRESS}"
+    create_quadlet_rootless "dev" "${DEV_USER}" "${DEV_TAG}" "${DEV_TOKEN}" "${EDGE_BIND_ADDRESS}" "${edge_iface}"
   else
     info "Skipping dev container installation."
   fi
